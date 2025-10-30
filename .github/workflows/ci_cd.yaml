@@ -1,0 +1,144 @@
+name: Full CI/CD - Infra + App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS Credentials via OIDC
+      # --------------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: github-actions-${{ github.run_id }}
+
+      # --------------------------------------------------
+      # 2. Setup Terraform
+      # --------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }} # Optional
+
+      # --------------------------------------------------
+      # 3. Bootstrap S3 + DynamoDB (Terraform Backend)
+      # --------------------------------------------------
+      - name: Initialize & Apply Terraform Backend
+        run: |
+          cd infra/terraform/backend
+          terraform init
+          terraform apply -auto-approve
+
+      # --------------------------------------------------
+      # 4. Deploy EKS + VPC (App Infra)
+      # --------------------------------------------------
+      - name: Deploy Infrastructure
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+          
+          terraform apply -auto-approve
+
+      # --------------------------------------------------
+      # 5. Update kubeconfig for EKS
+      # --------------------------------------------------
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 6. Login to Docker Hub
+      # --------------------------------------------------
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --------------------------------------------------
+      # 7. Build & Push Backend Image
+      # --------------------------------------------------
+      - name: Build & Push Backend
+        run: |
+          cd backend
+          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-backend:${{ github.sha }}
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "BACKEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 8. Build & Push Frontend Image
+      # --------------------------------------------------
+      - name: Build & Push Frontend
+        run: |
+          cd frontend
+          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-frontend:${{ github.sha }}
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "FRONTEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 9. Deploy App to EKS using Kustomize
+      # --------------------------------------------------
+      - name: Deploy Application
+        run: |
+          cd kustomize/overlays/dev
+          
+          # Patch images with new tags
+          kustomize edit set image \
+            backend=${{ env.BACKEND_IMAGE }} \
+            frontend=${{ env.FRONTEND_IMAGE }}
+          
+          # Apply to cluster
+          kustomize build . | kubectl apply -f -
+
+      # --------------------------------------------------
+      # 10. Wait for Frontend & Get NLB URL
+      # --------------------------------------------------
+      - name: Get Application URL
+        run: |
+          echo "Waiting for frontend deployment..."
+          kubectl rollout status deployment/frontend --timeout=300s
+          
+          echo "Waiting for Load Balancer..."
+          until kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' &>/dev/null; do
+            echo "Still waiting for NLB..."
+            sleep 10
+          done
+          
+          NLB_HOST=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          APP_URL="http://$NLB_HOST"
+          
+          echo "Application is LIVE!"
+          echo "URL: $APP_URL"
+          echo "APP_URL=$APP_URL" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 11. Final Success Message
+      # --------------------------------------------------
+      - name: Deployment Complete
+        run: |
+          echo "FULL STACK DEPLOYMENT SUCCESSFUL!"
+          echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Backend Image: ${{ env.BACKEND_IMAGE }}"
+          echo "Frontend Image: ${{ env.FRONTEND_IMAGE }}"
+          echo "Access your app at: ${{ env.APP_URL }}"
