@@ -1,22 +1,22 @@
-name: 4. Full Deploy (Backend + Infra + App)
+name: 3. Deploy App to K8s (Manual)
 
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type: FULL DEPLOY'
+        description: 'Type: DEPLOY APP'
         required: true
         default: ''
         type: string
 
 jobs:
-  full-deploy:
+  deploy-app:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
 
-    if: github.event.inputs.confirm == 'FULL DEPLOY'
+    if: github.event.inputs.confirm == 'DEPLOY APP'
 
     steps:
       - name: Checkout Code
@@ -32,56 +32,7 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       # --------------------------------------------------
-      # 2. Setup Terraform
-      # --------------------------------------------------
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.13.0
-
-      # --------------------------------------------------
-      # 3. Create Backend (S3 + DynamoDB)
-      # --------------------------------------------------
-      - name: Create Terraform Backend
-        run: |
-          cd infra/terraform/backend
-          terraform init || exit 1
-          terraform apply -auto-approve || true
-          echo "Backend created: ${{ secrets.TF_BACKEND_BUCKET }}"
-
-      # --------------------------------------------------
-      # 4. Deploy VPC + EKS
-      # --------------------------------------------------
-      - name: Deploy VPC + EKS
-        run: |
-          cd infra/terraform/app
-          terraform init \
-            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
-            -backend-config="key=eks/app.tfstate" \
-            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
-            -backend-config="region=${{ secrets.AWS_REGION }}" \
-            || exit 1
-
-          set +e
-          terraform apply -auto-approve > tf_apply.log 2>&1
-          TF_EXIT=$?
-          set -e
-
-          if grep -q "EntityAlreadyExists\|AlreadyExistsException\|ResourceAlreadyExistsException" tf_apply.log; then
-            echo "Known conflict (IAM/KMS/CW) — continuing"
-            TF_EXIT=0
-          fi
-
-          if [ $TF_EXIT -ne 0 ]; then
-            echo "Terraform apply failed:"
-            cat tf_apply.log
-            exit $TF_EXIT
-          fi
-
-          echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
-
-      # --------------------------------------------------
-      # 5. Install kubectl
+      # 2. Install kubectl
       # --------------------------------------------------
       - name: Install kubectl
         run: |
@@ -90,15 +41,15 @@ jobs:
           sudo mv kubectl /usr/local/bin/
 
       # --------------------------------------------------
-      # 6. Update kubeconfig
+      # 3. Update kubeconfig
       # --------------------------------------------------
       - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
-          echo "Connected to EKS"
+          echo "Connected to EKS cluster"
 
       # --------------------------------------------------
-      # 7. Login to Docker Hub
+      # 4. Login to Docker Hub
       # --------------------------------------------------
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -107,7 +58,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # --------------------------------------------------
-      # 8. Build & Push Backend
+      # 5. Build & Push Backend
       # --------------------------------------------------
       - name: Build & Push Backend
         run: |
@@ -119,7 +70,7 @@ jobs:
           echo "BACKEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
 
       # --------------------------------------------------
-      # 9. Build & Push Frontend
+      # 6. Build & Push Frontend
       # --------------------------------------------------
       - name: Build & Push Frontend
         run: |
@@ -131,7 +82,7 @@ jobs:
           echo "FRONTEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
 
       # --------------------------------------------------
-      # 10. Apply K8s Resources in Order
+      # 7. Apply K8s Resources in Order
       # --------------------------------------------------
       - name: Apply K8s Resources in Order
         run: |
@@ -153,7 +104,7 @@ jobs:
           kubectl apply -f kustomize/base/postgres.yaml
           echo "Postgres deployment applied"
 
-          # WAIT FOR POSTGRES
+          # WAIT FOR POSTGRES TO BE READY
           echo "Waiting for Postgres pod to be Running..."
           kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
           echo "Postgres is READY"
@@ -171,7 +122,7 @@ jobs:
           echo "Load Balancer applied"
 
       # --------------------------------------------------
-      # 11. Patch Image Tags
+      # 8. Patch Image Tags
       # --------------------------------------------------
       - name: Patch Image Tags
         run: |
@@ -180,7 +131,7 @@ jobs:
           echo "Images patched"
 
       # --------------------------------------------------
-      # 12. Wait for Frontend LB
+      # 9. Wait for Frontend LB
       # --------------------------------------------------
       - name: Get Clean NLB URL
         run: |
@@ -204,12 +155,11 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # 13. Final Summary
+      # 10. Final Summary
       # --------------------------------------------------
-      - name: Full Deployment Summary
+      - name: Deployment Summary
         run: |
-          echo "FULL DEPLOYMENT SUCCESSFUL"
-          echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "APP DEPLOYMENT COMPLETE"
           echo "Backend: ${{ env.BACKEND_IMAGE }}"
           echo "Frontend: ${{ env.FRONTEND_IMAGE }}"
           echo "Access App: ${{ env.APP_URL }}"

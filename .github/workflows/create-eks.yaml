@@ -1,0 +1,57 @@
+name: 2. Create VPC + EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: CREATE INFRA'
+        required: true
+        default: ''
+
+jobs:
+  create-infra:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event.inputs.confirm == 'CREATE INFRA'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      - name: Deploy VPC + EKS
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+
+          set +e
+          terraform apply -auto-approve > apply.log 2>&1
+          TF_EXIT=$?
+          set -e
+
+          if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
+            TF_EXIT=0
+          fi
+
+          if [ $TF_EXIT -ne 0 ]; then
+            cat apply.log
+            exit $TF_EXIT
+          fi
+
+          echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
