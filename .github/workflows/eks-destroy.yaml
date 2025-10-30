@@ -1,0 +1,49 @@
+name: Destroy EKS + VPC Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: DELETE EKS'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  destroy-eks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm == 'DELETE EKS'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      - name: Destroy EKS + VPC
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+          
+          terraform destroy -auto-approve
+          echo "EKS + VPC destroyed"
+
+      - name: Complete
+        run: echo "EKS DESTROYED - Run Nuclear to delete S3/DynamoDB"

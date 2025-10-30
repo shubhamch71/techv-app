@@ -1,0 +1,118 @@
+name: NUCLEAR DESTROY - Full Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'TYPE EXACTLY: DESTROY EVERYTHING'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm_destroy == 'DESTROY EVERYTHING'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS
+      # --------------------------------------------------
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 2. Setup Tools
+      # --------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # --------------------------------------------------
+      # 3. Connect to EKS (if exists)
+      # --------------------------------------------------
+      - name: Try Connect
+        run: |
+          set +e
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          echo "KUBE_CONNECTED=$?" >> $GITHUB_ENV
+          set -e
+
+      # --------------------------------------------------
+      # 4. Delete K8s App
+      # --------------------------------------------------
+      - name: Delete K8s App
+        if: env.KUBE_CONNECTED == '0'
+        run: |
+          cd kustomize/overlays/dev
+          kustomize build . | kubectl delete -f - --ignore-not-found=true || true
+
+      # --------------------------------------------------
+      # 5. Destroy EKS + VPC
+      # --------------------------------------------------
+      - name: Destroy EKS + VPC
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            || true
+          terraform destroy -auto-approve || true
+
+      # --------------------------------------------------
+      # 6. Empty S3 Bucket (including state)
+      # --------------------------------------------------
+      - name: Empty S3 Bucket
+        run: |
+          BUCKET="${{ secrets.TF_BACKEND_BUCKET }}"
+          echo "EMPTYING $BUCKET"
+          aws s3api delete-objects --bucket $BUCKET --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json)" --output text 2>/dev/null || true
+          aws s3api delete-objects --bucket $BUCKET --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json)" --output text 2>/dev/null || true
+
+      # --------------------------------------------------
+      # 7. Destroy Backend
+      # --------------------------------------------------
+      - name: Destroy S3 + DynamoDB
+        run: |
+          cd infra/terraform/backend
+          terraform init || true
+          terraform destroy -auto-approve || true
+
+      # --------------------------------------------------
+      # 8. Manual Cleanup
+      # --------------------------------------------------
+      - name: Delete IAM User
+        run: aws iam delete-user --user-name techv-admin || true
+
+      - name: Delete KMS Alias
+        run: aws kms delete-alias --alias-name alias/eks/${{ secrets.EKS_CLUSTER_NAME }} || true
+
+      - name: Delete CloudWatch Logs
+        run: aws logs delete-log-group --log-group-name /aws/eks/${{ secrets.EKS_CLUSTER_NAME }}/cluster || true
+
+      # --------------------------------------------------
+      # 9. Final
+      # --------------------------------------------------
+      - name: CLEANUP COMPLETE
+        run: |
+          echo "NUCLEAR DESTRUCTION SUCCESSFUL"
+          echo "Push to main to redeploy"

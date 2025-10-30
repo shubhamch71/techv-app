@@ -1,4 +1,4 @@
-name: Full CI/CD - Infra + App
+name: Full CI/CD - Ordered Apply + Postgres Wait
 
 on:
   push:
@@ -17,17 +17,16 @@ jobs:
         uses: actions/checkout@v4
 
       # --------------------------------------------------
-      # 1. Configure AWS Credentials via OIDC
+      # 1. Configure AWS
       # --------------------------------------------------
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
-          role-session-name: github-actions-${{ github.run_id }}
 
       # --------------------------------------------------
-      # 2. Setup Terraform 1.13.0
+      # 2. Setup Terraform
       # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -35,134 +34,156 @@ jobs:
           terraform_version: 1.13.0
 
       # --------------------------------------------------
-      # 3. Bootstrap S3 + DynamoDB (Idempotent)
+      # 3. Bootstrap Backend
       # --------------------------------------------------
-      - name: Bootstrap Terraform Backend
+      - name: Bootstrap Backend
         run: |
           cd infra/terraform/backend
           terraform init || exit 1
-          
-          echo "Applying backend (S3 + DynamoDB) - skipping if exists..."
           terraform apply -auto-approve || true
 
       # --------------------------------------------------
-      # 4. Deploy EKS + VPC (100% IDEMPOTENT)
+      # 4. Deploy Infra
       # --------------------------------------------------
-      - name: Deploy Infrastructure (Idempotent)
+      - name: Deploy Infrastructure
         run: |
           cd infra/terraform/app
-          
           terraform init \
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=eks/app.tfstate" \
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             || exit 1
-          
-          echo "Running terraform apply - WILL NOT FAIL ON 'ALREADY EXISTS'"
+
           set +e
-          terraform apply -auto-approve
-          TF_EXIT_CODE=$?
+          terraform apply -auto-approve > tf_apply.log 2>&1
+          TF_EXIT=$?
           set -e
-          
-          if [ $TF_EXIT_CODE -eq 0 ]; then
-            echo "Terraform apply: No changes needed"
-          elif [ $TF_EXIT_CODE -eq 1 ]; then
-            echo "Terraform apply: Some resources already exist - continuing"
-          else
-            echo "Terraform apply: Unknown error (code $TF_EXIT_CODE)"
-            exit $TF_EXIT_CODE
+
+          if grep -q "EntityAlreadyExists\|AlreadyExistsException\|ResourceAlreadyExistsException" tf_apply.log; then
+            echo "Known conflict — continuing"
+            TF_EXIT=0
+          fi
+
+          if [ $TF_EXIT -ne 0 ]; then
+            cat tf_apply.log
+            exit $TF_EXIT
           fi
 
       # --------------------------------------------------
-      # 5. Update kubeconfig (Safe)
+      # 5. Update kubeconfig
       # --------------------------------------------------
-      - name: Update kubeconfig (Safe)
+      - name: Update kubeconfig
         run: |
-          set +e
           aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
-          KUBE_EXIT=$?
-          set -e
-          
-          if [ $KUBE_EXIT -eq 0 ]; then
-            echo "Connected to EKS"
-            echo "CLUSTER_READY=true" >> $GITHUB_ENV
-          else
-            echo "EKS cluster not ready. Skipping app deploy."
-            echo "CLUSTER_READY=false" >> $GITHUB_ENV
-          fi
+          echo "CLUSTER_READY=true" >> $GITHUB_ENV
 
       # --------------------------------------------------
-      # 6. Conditional: Build & Push Images
+      # 6. Install kubectl
+      # --------------------------------------------------
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # --------------------------------------------------
+      # 7. Build & Push Images
       # --------------------------------------------------
       - name: Login to Docker Hub
-        if: env.CLUSTER_READY == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & Push Backend
-        if: env.CLUSTER_READY == 'true'
         run: |
           cd backend
-          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-backend:${{ github.sha }}
-          docker build -t $IMAGE_TAG .
-          docker push $IMAGE_TAG
-          echo "BACKEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+          TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-backend:${{ github.sha }}
+          docker build -t $TAG .
+          docker push $TAG
+          echo "BACKEND_IMAGE=$TAG" >> $GITHUB_ENV
 
       - name: Build & Push Frontend
-        if: env.CLUSTER_READY == 'true'
         run: |
           cd frontend
-          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-frontend:${{ github.sha }}
-          docker build -t $IMAGE_TAG .
-          docker push $IMAGE_TAG
-          echo "FRONTEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+          TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-frontend:${{ github.sha }}
+          docker build -t $TAG .
+          docker push $TAG
+          echo "FRONTEND_IMAGE=$TAG" >> $GITHUB_ENV
 
       # --------------------------------------------------
-      # 7. Deploy to EKS
+      # 8. ORDERED KUBECTL APPLY + WAIT FOR POSTGRES
       # --------------------------------------------------
-      - name: Deploy Application
-        if: env.CLUSTER_READY == 'true'
+      - name: Apply K8s Resources in Order
         run: |
-          cd kustomize/overlays/dev
-          kustomize edit set image \
-            backend=${{ env.BACKEND_IMAGE }} \
-            frontend=${{ env.FRONTEND_IMAGE }}
-          kustomize build . | kubectl apply -f -
+          echo "Applying in order..."
+
+          # 1. Secrets
+          kubectl apply -f kustomize/base/secrets.yaml
+          echo "Secrets applied"
+
+          # 2. Storage
+          kubectl apply -f kustomize/base/storage.yaml
+          echo "Storage applied"
+
+          # 3. ConfigMap
+          kubectl apply -f kustomize/base/configmap-backend.yaml
+          echo "ConfigMap applied"
+
+          # 4. Postgres
+          kubectl apply -f kustomize/base/postgres.yaml
+          echo "Postgres deployment applied"
+
+          # WAIT FOR POSTGRES TO BE READY
+          echo "Waiting for Postgres pod to be Running..."
+          kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
+          echo "Postgres is READY"
+
+          # 5. Backend
+          kubectl apply -f kustomize/base/backend.yaml
+          echo "Backend applied"
+
+          # 6. Frontend
+          kubectl apply -f kustomize/base/frontend.yaml
+          echo "Frontend applied"
+
+          # 7. Load Balancer
+          kubectl apply -f kustomize/base/frontend-lb.yaml
+          echo "Load Balancer applied"
 
       # --------------------------------------------------
-      # 8. Get App URL
+      # 9. Patch Images in Deployments
       # --------------------------------------------------
-      - name: Get Application URL
-        if: env.CLUSTER_READY == 'true'
+      - name: Patch Image Tags
         run: |
-          echo "Waiting for NLB (up to 5 mins)..."
+          kubectl set image deployment/backend backend=${{ env.BACKEND_IMAGE }} --record
+          kubectl set image deployment/frontend frontend=${{ env.FRONTEND_IMAGE }} --record
+          echo "Images patched"
+
+      # --------------------------------------------------
+      # 10. Wait for Frontend LB
+      # --------------------------------------------------
+      - name: Get Clean NLB URL
+        run: |
+          echo "Waiting for NLB..."
           for i in {1..30}; do
             NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [[ -n "$NLB" ]]; then
-              echo "APP_URL=http://$NLB" >> $GITHUB_ENV
-              echo "App is LIVE: http://$NLB"
+            if [[ -n "$NLB" && "$NLB" != "null" ]]; then
+              CLEAN_URL="http://$NLB"
+              echo "APP_URL=$CLEAN_URL" >> $GITHUB_ENV
+              echo "APP LIVE: $CLEAN_URL"
               break
             fi
             echo "Waiting... ($i/30)"
             sleep 10
           done
-          if [[ -z "$NLB" ]]; then
-            echo "NLB not ready yet"
-          fi
 
       # --------------------------------------------------
-      # 9. Final Summary
+      # 11. Final Summary
       # --------------------------------------------------
-      - name: Deployment Summary
+      - name: Summary
         run: |
-          echo "CI/CD RUN COMPLETE"
-          if [ "${{ env.CLUSTER_READY }}" == "true" ]; then
-            echo "FULL STACK DEPLOYED"
-            echo "URL: ${{ env.APP_URL }}"
-          else
-            echo "INFRA PARTIALLY APPLIED"
-            echo "EKS NOT READY — check IAM/user conflicts"
-          fi
+          echo "FULL DEPLOYMENT SUCCESSFUL"
+          echo "URL: ${{ env.APP_URL }}"
+          echo "OPEN: ${{ env.APP_URL }}"

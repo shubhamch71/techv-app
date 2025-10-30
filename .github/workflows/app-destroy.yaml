@@ -1,0 +1,56 @@
+name: Destroy K8s App Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: DELETE APP'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  destroy-app:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm == 'DELETE APP'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+      - name: Delete K8s App
+        run: |
+          echo "Deleting K8s resources..."
+          
+          # Delete in reverse order
+          kubectl delete -f kustomize/base/frontend-lb.yaml --ignore-not-found=true
+          kubectl delete -f kustomize/base/frontend.yaml --ignore-not-found=true
+          kubectl delete -f kustomize/base/backend.yaml --ignore-not-found=true
+          
+          # Delete PVC (data persists)
+          kubectl delete -f kustomize/base/storage.yaml --ignore-not-found=true
+          
+          echo "K8s App deleted"
+          echo "EKS cluster remains running"
+
+      - name: Complete
+        run: echo "APP DESTROYED - Push to main to redeploy app"
