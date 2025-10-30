@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+
+resources:
+  - secret.yaml
+  - storage.yaml
+  - configmap-backend.yaml
+  - postgres.yaml
+  - backend.yaml
+  - configmap-frontend.yaml
+  - frontend.yaml
+  - frontend-lb.yaml
+
+secretGenerator:
+  - name: postgres-secret
+    envs:
+      - secrets.env
