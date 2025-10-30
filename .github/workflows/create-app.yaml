@@ -89,19 +89,19 @@ jobs:
           echo "Applying in order..."
 
           # 1. Secrets
-          kubectl apply -f kustomize/base/secret.yaml
+          kubectl apply -f kustomise/base/secret.yaml
           echo "Secrets applied"
 
           # 2. Storage
-          kubectl apply -f kustomize/base/storage.yaml
+          kubectl apply -f kustomise/base/storage.yaml
           echo "Storage applied"
 
           # 3. ConfigMap
-          kubectl apply -f kustomize/base/configmap-backend.yaml
+          kubectl apply -f kustomise/base/configmap-backend.yaml
           echo "ConfigMap applied"
 
           # 4. Postgres
-          kubectl apply -f kustomize/base/postgres.yaml
+          kubectl apply -f kustomise/base/postgres.yaml
           echo "Postgres deployment applied"
 
           # WAIT FOR POSTGRES TO BE READY
@@ -110,15 +110,15 @@ jobs:
           echo "Postgres is READY"
 
           # 5. Backend
-          kubectl apply -f kustomize/base/backend.yaml
+          kubectl apply -f kustomise/base/backend.yaml
           echo "Backend applied"
 
           # 6. Frontend
-          kubectl apply -f kustomize/base/frontend.yaml
+          kubectl apply -f kustomise/base/frontend.yaml
           echo "Frontend applied"
 
           # 7. Load Balancer
-          kubectl apply -f kustomize/base/frontend-lb.yaml
+          kubectl apply -f kustomise/base/frontend-lb.yaml
           echo "Load Balancer applied"
 
       # --------------------------------------------------
