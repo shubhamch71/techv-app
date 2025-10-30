@@ -89,19 +89,17 @@ jobs:
       # --------------------------------------------------
       # 7. Inject Secrets + Apply via Kustomize
       # --------------------------------------------------
-      - name: Apply K8s via Kustomize (with Secrets)
+      - name: Apply K8s via Kustomize (Fixed)
         run: |
-          echo "Injecting GitHub Secrets into secrets.env..."
-
-          cat > kustomise/base/secrets.env << EOF
+          echo "Injecting secrets..."
+          cat > kustomize/base/secrets.env << EOF
           POSTGRES_USER=${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
           POSTGRES_DB=${{ secrets.POSTGRES_DB }}
           EOF
 
-          echo "Applying all resources via Kustomize..."
-          kustomize build kustomise/base | kubectl apply -f -
-
+          echo "Applying via Kustomize..."
+          kustomize build kustomize/base | kubectl apply -f -
           echo "Waiting for Postgres pod to be Ready..."
           kubectl get po 
           kubectl logs deploy/postgres
