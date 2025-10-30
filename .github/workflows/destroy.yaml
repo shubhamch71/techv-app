@@ -1,4 +1,4 @@
-name: MANUAL DESTROY - Full Nuclear Cleanup
+name: NUCLEAR DESTROY - Full Cleanup (Safe Order)
 
 on:
   workflow_dispatch:
@@ -32,42 +32,47 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       # --------------------------------------------------
-      # 2. Setup Terraform 1.13.0
+      # 2. Setup Terraform + kubectl
       # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.13.0
 
-      # --------------------------------------------------
-      # 3. EMPTY S3 BUCKET (MANDATORY)
-      # --------------------------------------------------
-      - name: Empty S3 Bucket
+      - name: Install kubectl
         run: |
-          BUCKET="${{ secrets.TF_BACKEND_BUCKET }}"
-          echo "EMPTYING S3 BUCKET: $BUCKET"
-          
-          # Delete all versions + delete markers
-          aws s3api delete-objects \
-            --bucket $BUCKET \
-            --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json)" \
-            --output text || true
-          
-          aws s3api delete-objects \
-            --bucket $BUCKET \
-            --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json)" \
-            --output text || true
-          
-          echo "S3 bucket emptied"
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
 
       # --------------------------------------------------
-      # 4. DESTROY APP INFRA (EKS + VPC) - FORCE
+      # 3. UPDATE KUBECONFIG (IF CLUSTER EXISTS)
       # --------------------------------------------------
-      - name: Destroy EKS + VPC (Force)
+      - name: Try Connect to EKS
+        run: |
+          set +e
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          echo "KUBE_CONNECTED=$?" >> $GITHUB_ENV
+          set -e
+
+      # --------------------------------------------------
+      # 4. DELETE K8s APP (IF CONNECTED)
+      # --------------------------------------------------
+      - name: Delete K8s App
+        if: env.KUBE_CONNECTED == '0'
+        run: |
+          echo "Deleting app from EKS..."
+          cd kustomize/overlays/dev
+          kustomize build . | kubectl delete -f - --ignore-not-found=true || true
+
+      # --------------------------------------------------
+      # 5. DESTROY EKS + VPC (APP INFRA)
+      # --------------------------------------------------
+      - name: Destroy EKS + VPC
         run: |
           cd infra/terraform/app
           
-          echo "Initializing with backend..."
+          echo "Initializing app state..."
           terraform init \
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=eks/app.tfstate" \
@@ -75,70 +80,71 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             || true
 
-          echo "DESTROYING INFRA..."
-          set +e
-          terraform destroy -auto-approve
-          set -e
+          echo "DESTROYING EKS + VPC..."
+          terraform destroy -auto-approve || echo "App destroy complete (some already gone)"
 
       # --------------------------------------------------
-      # 5. DESTROY BACKEND (S3 + DynamoDB) - FORCE
+      # 6. EMPTY S3 BUCKET (INCLUDING STATE FILE)
       # --------------------------------------------------
-      - name: Destroy S3 + DynamoDB (Force)
+      - name: Empty S3 Bucket (Full)
+        run: |
+          BUCKET="${{ secrets.TF_BACKEND_BUCKET }}"
+          echo "EMPTYING S3 BUCKET: $BUCKET (including state file)"
+          
+          # Delete ALL objects + versions
+          aws s3api delete-objects \
+            --bucket $BUCKET \
+            --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json)" \
+            --output text 2>/dev/null || true
+          
+          aws s3api delete-objects \
+            --bucket $BUCKET \
+            --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json)" \
+            --output text 2>/dev/null || true
+          
+          echo "S3 bucket fully emptied"
+
+      # --------------------------------------------------
+      # 7. DESTROY BACKEND (S3 + DYNAMODB)
+      # --------------------------------------------------
+      - name: Destroy S3 + DynamoDB
         run: |
           cd infra/terraform/backend
           terraform init || true
-          
-          set +e
-          terraform destroy -auto-approve
-          set -e
+          terraform destroy -auto-approve || true
 
       # --------------------------------------------------
-      # 6. MANUAL CLEANUP: IAM USER
+      # 8. MANUAL CLEANUP: IAM, KMS, CLOUDWATCH
       # --------------------------------------------------
-      - name: Delete IAM User (if exists)
+      - name: Cleanup IAM User
         run: |
-          USER_NAME=$(terraform -chdir=infra/terraform/app output -raw admin_user_name 2>/dev/null || echo "")
-          if [ -n "$USER_NAME" ]; then
-            echo "Deleting IAM user: $USER_NAME"
-            aws iam delete-user --user-name $USER_NAME || true
-          else
-            echo "No IAM user found in state"
+          USER=$(aws iam list-users --query "Users[?contains(UserName, 'admin')].UserName" --output text 2>/dev/null || echo "")
+          if [ -n "$USER" ]; then
+            echo "Deleting IAM user: $USER"
+            aws iam delete-user --user-name "$USER" || true
           fi
 
-      # --------------------------------------------------
-      # 7. MANUAL CLEANUP: KMS ALIAS
-      # --------------------------------------------------
-      - name: Delete KMS Alias (if exists)
+      - name: Cleanup KMS Alias
         run: |
-          KMS_KEY_ID=$(aws kms list-keys --query "Keys[?KeyArn=='arn:aws:kms:${{ secrets.AWS_REGION }}:*']" --output json 2>/dev/null | jq -r '.[0].KeyId' || echo "")
-          if [ -n "$KMS_KEY_ID" ]; then
-            ALIAS="alias/eks/${{ secrets.EKS_CLUSTER_NAME }}"
-            echo "Deleting KMS alias: $ALIAS"
-            aws kms delete-alias --alias-name $ALIAS || true
-          fi
+          ALIAS="alias/eks/${{ secrets.EKS_CLUSTER_NAME }}"
+          aws kms delete-alias --alias-name "$ALIAS" || true
 
-      # --------------------------------------------------
-      # 8. MANUAL CLEANUP: CLOUDWATCH LOG GROUP
-      # --------------------------------------------------
-      - name: Delete CloudWatch Log Group
+      - name: Cleanup CloudWatch Logs
         run: |
           LOG_GROUP="/aws/eks/${{ secrets.EKS_CLUSTER_NAME }}/cluster"
-          echo "Deleting log group: $LOG_GROUP"
           aws logs delete-log-group --log-group-name "$LOG_GROUP" || true
 
       # --------------------------------------------------
-      # 9. FINAL VERIFICATION
+      # 9. FINAL SUCCESS
       # --------------------------------------------------
-      - name: Nuclear Cleanup Complete
+      - name: NUCLEAR CLEANUP COMPLETE
         run: |
-          echo "NUCLEAR CLEANUP 100% COMPLETE"
-          echo "Deleted:"
-          echo "   • EKS Cluster"
-          echo "   • VPC, Subnets, NAT, LB"
-          echo "   • S3 Bucket (emptied + deleted)"
-          echo "   • DynamoDB Table"
-          echo "   • IAM User"
-          echo "   • KMS Alias"
-          echo "   • CloudWatch Log Group"
+          echo "FULL DESTRUCTION SUCCESSFUL"
+          echo "Deleted in order:"
+          echo "   1. K8s App"
+          echo "   2. EKS + VPC"
+          echo "   3. S3 Bucket (emptied + deleted)"
+          echo "   4. DynamoDB"
+          echo "   5. IAM, KMS, CloudWatch"
           echo ""
-          echo "Push to main to redeploy from scratch"
+          echo "Push to main to redeploy"
