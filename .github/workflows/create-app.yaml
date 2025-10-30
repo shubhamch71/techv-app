@@ -89,7 +89,7 @@ jobs:
           echo "Applying in order..."
 
           # 1. Secrets
-          kubectl apply -f kustomize/base/secrets.yaml
+          kubectl apply -f kustomize/base/secret.yaml
           echo "Secrets applied"
 
           # 2. Storage
