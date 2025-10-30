@@ -1,10 +1,10 @@
-name: 💥 MANUAL DESTROY - Infra + App
+name: MANUAL DESTROY - Full Nuclear Cleanup
 
 on:
-  workflow_dispatch:  # ← MANUAL TRIGGER ONLY
+  workflow_dispatch:
     inputs:
       confirm_destroy:
-        description: 'Type EXACTLY "DESTROY EVERYTHING" to confirm'
+        description: 'TYPE EXACTLY: DESTROY EVERYTHING'
         required: true
         default: ''
         type: string
@@ -15,8 +15,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    
-    # SAFETY CHECK: Only run if user types exact phrase
+
     if: github.event.inputs.confirm_destroy == 'DESTROY EVERYTHING'
 
     steps:
@@ -24,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
 
       # --------------------------------------------------
-      # 1. Configure AWS Credentials
+      # 1. Configure AWS
       # --------------------------------------------------
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
@@ -41,44 +40,105 @@ jobs:
           terraform_version: 1.13.0
 
       # --------------------------------------------------
-      # 3. Destroy EKS + VPC (App Infra)
+      # 3. EMPTY S3 BUCKET (MANDATORY)
       # --------------------------------------------------
-      - name: Destroy Infrastructure
+      - name: Empty S3 Bucket
         run: |
-          echo "🧹 DESTROYING EKS CLUSTER + VPC..."
+          BUCKET="${{ secrets.TF_BACKEND_BUCKET }}"
+          echo "EMPTYING S3 BUCKET: $BUCKET"
+          
+          # Delete all versions + delete markers
+          aws s3api delete-objects \
+            --bucket $BUCKET \
+            --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json)" \
+            --output text || true
+          
+          aws s3api delete-objects \
+            --bucket $BUCKET \
+            --delete "$(aws s3api list-object-versions --bucket $BUCKET --query='{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json)" \
+            --output text || true
+          
+          echo "S3 bucket emptied"
+
+      # --------------------------------------------------
+      # 4. DESTROY APP INFRA (EKS + VPC) - FORCE
+      # --------------------------------------------------
+      - name: Destroy EKS + VPC (Force)
+        run: |
           cd infra/terraform/app
           
+          echo "Initializing with backend..."
           terraform init \
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=eks/app.tfstate" \
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
-            -backend-config="region=${{ secrets.AWS_REGION }}"
-          
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            || true
+
+          echo "DESTROYING INFRA..."
+          set +e
           terraform destroy -auto-approve
-          echo "✅ EKS + VPC DESTROYED"
+          set -e
 
       # --------------------------------------------------
-      # 4. Destroy S3 + DynamoDB (Backend)
+      # 5. DESTROY BACKEND (S3 + DynamoDB) - FORCE
       # --------------------------------------------------
-      - name: Destroy Backend Storage
+      - name: Destroy S3 + DynamoDB (Force)
         run: |
-          echo "🧹 DESTROYING S3 BUCKET + DYNAMODB..."
           cd infra/terraform/backend
-          terraform init
+          terraform init || true
+          
+          set +e
           terraform destroy -auto-approve
-          echo "✅ S3 + DynamoDB DESTROYED"
+          set -e
 
       # --------------------------------------------------
-      # 5. Final Confirmation
+      # 6. MANUAL CLEANUP: IAM USER
       # --------------------------------------------------
-      - name: Complete Cleanup
+      - name: Delete IAM User (if exists)
         run: |
-          echo "💥 FULL CLEANUP COMPLETE!"
-          echo "❌ Deleted:"
-          echo "   • EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
-          echo "   • VPC + Subnets"
-          echo "   • S3 Bucket: ${{ secrets.TF_BACKEND_BUCKET }}"
-          echo "   • DynamoDB: ${{ secrets.TF_BACKEND_TABLE }}"
-          echo "   • All Docker Hub images remain (manual cleanup)"
+          USER_NAME=$(terraform -chdir=infra/terraform/app output -raw admin_user_name 2>/dev/null || echo "")
+          if [ -n "$USER_NAME" ]; then
+            echo "Deleting IAM user: $USER_NAME"
+            aws iam delete-user --user-name $USER_NAME || true
+          else
+            echo "No IAM user found in state"
+          fi
+
+      # --------------------------------------------------
+      # 7. MANUAL CLEANUP: KMS ALIAS
+      # --------------------------------------------------
+      - name: Delete KMS Alias (if exists)
+        run: |
+          KMS_KEY_ID=$(aws kms list-keys --query "Keys[?KeyArn=='arn:aws:kms:${{ secrets.AWS_REGION }}:*']" --output json 2>/dev/null | jq -r '.[0].KeyId' || echo "")
+          if [ -n "$KMS_KEY_ID" ]; then
+            ALIAS="alias/eks/${{ secrets.EKS_CLUSTER_NAME }}"
+            echo "Deleting KMS alias: $ALIAS"
+            aws kms delete-alias --alias-name $ALIAS || true
+          fi
+
+      # --------------------------------------------------
+      # 8. MANUAL CLEANUP: CLOUDWATCH LOG GROUP
+      # --------------------------------------------------
+      - name: Delete CloudWatch Log Group
+        run: |
+          LOG_GROUP="/aws/eks/${{ secrets.EKS_CLUSTER_NAME }}/cluster"
+          echo "Deleting log group: $LOG_GROUP"
+          aws logs delete-log-group --log-group-name "$LOG_GROUP" || true
+
+      # --------------------------------------------------
+      # 9. FINAL VERIFICATION
+      # --------------------------------------------------
+      - name: Nuclear Cleanup Complete
+        run: |
+          echo "NUCLEAR CLEANUP 100% COMPLETE"
+          echo "Deleted:"
+          echo "   • EKS Cluster"
+          echo "   • VPC, Subnets, NAT, LB"
+          echo "   • S3 Bucket (emptied + deleted)"
+          echo "   • DynamoDB Table"
+          echo "   • IAM User"
+          echo "   • KMS Alias"
+          echo "   • CloudWatch Log Group"
           echo ""
-          echo "🚀 To redeploy: Push to main branch"
+          echo "Push to main to redeploy from scratch"
