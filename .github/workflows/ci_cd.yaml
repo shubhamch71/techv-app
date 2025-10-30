@@ -1,70 +1,109 @@
-# ... (previous steps unchanged)
+name: Full CI/CD - Infra + App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       # --------------------------------------------------
-      # 4. Deploy Infrastructure (100% IDEMPOTENT)
+      # 1. Configure AWS Credentials via OIDC
       # --------------------------------------------------
-      - name: Deploy Infrastructure (Idempotent & Fail-Safe)
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: github-actions-${{ github.run_id }}
+
+      # --------------------------------------------------
+      # 2. Setup Terraform 1.13.0
+      # --------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      # --------------------------------------------------
+      # 3. Bootstrap S3 + DynamoDB (Idempotent)
+      # --------------------------------------------------
+      - name: Bootstrap Terraform Backend
+        run: |
+          cd infra/terraform/backend
+          terraform init || exit 1
+          
+          echo "Applying backend (S3 + DynamoDB) - skipping if exists..."
+          terraform apply -auto-approve || true
+
+      # --------------------------------------------------
+      # 4. Deploy EKS + VPC (100% IDEMPOTENT)
+      # --------------------------------------------------
+      - name: Deploy Infrastructure (Idempotent)
         run: |
           cd infra/terraform/app
           
-          echo "Initializing Terraform with backend..."
           terraform init \
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=eks/app.tfstate" \
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
-            || { echo "Init failed"; exit 1; }
-
-          echo "Running terraform apply - WILL NOT FAIL ON 'ALREADY EXISTS'"
+            || exit 1
           
-          # CAPTURE OUTPUT + EXIT CODE
-          set +e  # Disable exit on error
+          echo "Running terraform apply - WILL NOT FAIL ON 'ALREADY EXISTS'"
+          set +e
           terraform apply -auto-approve
           TF_EXIT_CODE=$?
-          set -e  # Re-enable
-
+          set -e
+          
           if [ $TF_EXIT_CODE -eq 0 ]; then
             echo "Terraform apply: No changes needed"
           elif [ $TF_EXIT_CODE -eq 1 ]; then
-            echo "Terraform apply: Errors occurred (likely 'already exists')"
-            echo "Checking if cluster was created anyway..."
-            # Continue — we’ll check cluster later
+            echo "Terraform apply: Some resources already exist - continuing"
           else
             echo "Terraform apply: Unknown error (code $TF_EXIT_CODE)"
             exit $TF_EXIT_CODE
           fi
 
       # --------------------------------------------------
-      # 5. SAFE KUBECONFIG UPDATE (ONLY IF CLUSTER EXISTS)
+      # 5. Update kubeconfig (Safe)
       # --------------------------------------------------
       - name: Update kubeconfig (Safe)
         run: |
-          echo "Attempting to connect to EKS cluster..."
-          
           set +e
           aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
-          KUBECTL_EXIT=$?
+          KUBE_EXIT=$?
           set -e
           
-          if [ $KUBECTL_EXIT -eq 0 ]; then
-            echo "Connected to EKS cluster"
+          if [ $KUBE_EXIT -eq 0 ]; then
+            echo "Connected to EKS"
+            echo "CLUSTER_READY=true" >> $GITHUB_ENV
           else
-            echo "EKS cluster not ready or not created yet. Skipping app deploy."
+            echo "EKS cluster not ready. Skipping app deploy."
             echo "CLUSTER_READY=false" >> $GITHUB_ENV
           fi
 
       # --------------------------------------------------
-      # 6. CONDITIONAL: Only deploy app if cluster exists
+      # 6. Conditional: Build & Push Images
       # --------------------------------------------------
       - name: Login to Docker Hub
-        if: env.CLUSTER_READY != 'false'
+        if: env.CLUSTER_READY == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & Push Backend
-        if: env.CLUSTER_READY != 'false'
+        if: env.CLUSTER_READY == 'true'
         run: |
           cd backend
           IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-backend:${{ github.sha }}
@@ -73,7 +112,7 @@
           echo "BACKEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
 
       - name: Build & Push Frontend
-        if: env.CLUSTER_READY != 'false'
+        if: env.CLUSTER_READY == 'true'
         run: |
           cd frontend
           IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-frontend:${{ github.sha }}
@@ -81,8 +120,11 @@
           docker push $IMAGE_TAG
           echo "FRONTEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Deploy to EKS
-        if: env.CLUSTER_READY != 'false'
+      # --------------------------------------------------
+      # 7. Deploy to EKS
+      # --------------------------------------------------
+      - name: Deploy Application
+        if: env.CLUSTER_READY == 'true'
         run: |
           cd kustomize/overlays/dev
           kustomize edit set image \
@@ -90,10 +132,13 @@
             frontend=${{ env.FRONTEND_IMAGE }}
           kustomize build . | kubectl apply -f -
 
-      - name: Get App URL
-        if: env.CLUSTER_READY != 'false'
+      # --------------------------------------------------
+      # 8. Get App URL
+      # --------------------------------------------------
+      - name: Get Application URL
+        if: env.CLUSTER_READY == 'true'
         run: |
-          echo "Waiting for NLB..."
+          echo "Waiting for NLB (up to 5 mins)..."
           for i in {1..30}; do
             NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
             if [[ -n "$NLB" ]]; then
@@ -101,21 +146,23 @@
               echo "App is LIVE: http://$NLB"
               break
             fi
+            echo "Waiting... ($i/30)"
             sleep 10
           done
           if [[ -z "$NLB" ]]; then
-            echo "NLB not ready. Check later."
+            echo "NLB not ready yet"
           fi
 
       # --------------------------------------------------
-      # FINAL SUMMARY
+      # 9. Final Summary
       # --------------------------------------------------
-      - name: Summary
+      - name: Deployment Summary
         run: |
-          if [ "${{ env.CLUSTER_READY }}" == "false" ]; then
-            echo "INFRA PARTIALLY APPLIED (some resources exist)"
-            echo "EKS CLUSTER NOT READY — retry or fix IAM/user conflicts"
-          else
-            echo "FULL DEPLOYMENT SUCCESSFUL"
+          echo "CI/CD RUN COMPLETE"
+          if [ "${{ env.CLUSTER_READY }}" == "true" ]; then
+            echo "FULL STACK DEPLOYED"
             echo "URL: ${{ env.APP_URL }}"
+          else
+            echo "INFRA PARTIALLY APPLIED"
+            echo "EKS NOT READY — check IAM/user conflicts"
           fi
