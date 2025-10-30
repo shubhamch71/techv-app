@@ -1,0 +1,25 @@
+.idea
+frontend/node_modules
+#infra/*
+# Ignore Terraform's .terraform directory and its subdirectories
+infra/terraform/.terraform/
+
+# Ignore the lock file
+infra/terraform/.terraform.lock.hcl
+
+# Ignore Terraform provider binaries
+infra/terraform/.terraform/providers/
+
+# Ignore Terraform module directories
+infra/terraform/.terraform/modules/
+
+# Ignore module-specific files within modules/
+infra/terraform/.terraform/modules/*.json
+
+# Ignore all provider binaries inside .terraform/providers/
+infra/terraform/.terraform/providers/registry.terraform.io/hashicorp/*/*/*/terraform-provider-*
+
+# Ignore all LICENSE.txt files inside .terraform/providers/
+infra/terraform/.terraform/providers/registry.terraform.io/hashicorp/*/*/*/LICENSE.txt
+infra/terraform/backend/.terraform.lock.hcl
+infra/terraform/app/.terraform.lock.hcl

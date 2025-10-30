@@ -1,0 +1,10 @@
+# configmap-backend.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: default
+data:
+  DB_HOST: postgres-service
+  DB_PORT: "5432"
+  ALLOWED_ORIGINS: "*"

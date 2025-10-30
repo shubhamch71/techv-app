@@ -1,0 +1,16 @@
+# frontend-lb.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-lb
+  namespace: default
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"   # optional: use "classic" for CLB
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
