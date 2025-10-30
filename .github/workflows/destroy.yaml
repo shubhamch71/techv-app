@@ -1,0 +1,84 @@
+name: 💥 MANUAL DESTROY - Infra + App
+
+on:
+  workflow_dispatch:  # ← MANUAL TRIGGER ONLY
+    inputs:
+      confirm_destroy:
+        description: 'Type EXACTLY "DESTROY EVERYTHING" to confirm'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    # SAFETY CHECK: Only run if user types exact phrase
+    if: github.event.inputs.confirm_destroy == 'DESTROY EVERYTHING'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS Credentials
+      # --------------------------------------------------
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 2. Setup Terraform 1.13.0
+      # --------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      # --------------------------------------------------
+      # 3. Destroy EKS + VPC (App Infra)
+      # --------------------------------------------------
+      - name: Destroy Infrastructure
+        run: |
+          echo "🧹 DESTROYING EKS CLUSTER + VPC..."
+          cd infra/terraform/app
+          
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+          
+          terraform destroy -auto-approve
+          echo "✅ EKS + VPC DESTROYED"
+
+      # --------------------------------------------------
+      # 4. Destroy S3 + DynamoDB (Backend)
+      # --------------------------------------------------
+      - name: Destroy Backend Storage
+        run: |
+          echo "🧹 DESTROYING S3 BUCKET + DYNAMODB..."
+          cd infra/terraform/backend
+          terraform init
+          terraform destroy -auto-approve
+          echo "✅ S3 + DynamoDB DESTROYED"
+
+      # --------------------------------------------------
+      # 5. Final Confirmation
+      # --------------------------------------------------
+      - name: Complete Cleanup
+        run: |
+          echo "💥 FULL CLEANUP COMPLETE!"
+          echo "❌ Deleted:"
+          echo "   • EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "   • VPC + Subnets"
+          echo "   • S3 Bucket: ${{ secrets.TF_BACKEND_BUCKET }}"
+          echo "   • DynamoDB: ${{ secrets.TF_BACKEND_TABLE }}"
+          echo "   • All Docker Hub images remain (manual cleanup)"
+          echo ""
+          echo "🚀 To redeploy: Push to main branch"
