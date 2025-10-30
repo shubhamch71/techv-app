@@ -1,0 +1,180 @@
+name: 4. Full Deploy (Backend + Infra + App)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: FULL DEPLOY'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  full-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm == 'FULL DEPLOY'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS
+      # --------------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 2. Setup Terraform
+      # --------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      # --------------------------------------------------
+      # 3. Create Backend (S3 + DynamoDB)
+      # --------------------------------------------------
+      - name: Create Terraform Backend
+        run: |
+          cd infra/terraform/backend
+          terraform init || exit 1
+          terraform apply -auto-approve || true
+          echo "Backend: ${{ secrets.TF_BACKEND_BUCKET }}"
+
+      # --------------------------------------------------
+      # 4. Deploy VPC + EKS
+      # --------------------------------------------------
+      - name: Deploy VPC + EKS
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            || exit 1
+
+          set +e
+          terraform apply -auto-approve > tf_apply.log 2>&1
+          TF_EXIT=$?
+          set -e
+
+          if grep -q "EntityAlreadyExists\|AlreadyExistsException\|ResourceAlreadyExistsException" tf_apply.log; then
+            TF_EXIT=0
+          fi
+
+          if [ $TF_EXIT -ne 0 ]; then
+            cat tf_apply.log
+            exit $TF_EXIT
+          fi
+
+          echo "EKS: ${{ secrets.EKS_CLUSTER_NAME }}"
+
+      # --------------------------------------------------
+      # 5. Install kubectl + kustomize
+      # --------------------------------------------------
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      # --------------------------------------------------
+      # 6. Update kubeconfig
+      # --------------------------------------------------
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+
+      # --------------------------------------------------
+      # 7. Login to Docker Hub
+      # --------------------------------------------------
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --------------------------------------------------
+      # 8. Build & Push Backend
+      # --------------------------------------------------
+      - name: Build & Push Backend
+        run: |
+          cd backend
+          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-backend:${{ github.sha }}
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "BACKEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 9. Build & Push Frontend
+      # --------------------------------------------------
+      - name: Build & Push Frontend
+        run: |
+          cd frontend
+          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-frontend:${{ github.sha }}
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "FRONTEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 10. Inject Secrets + Apply via Kustomize
+      # --------------------------------------------------
+      - name: Apply K8s via Kustomize (with Secrets)
+        run: |
+          cat > kustomize/base/secrets.env << EOF
+          POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+          EOF
+
+          kustomize build kustomize/base | kubectl apply -f -
+
+          kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
+
+      # --------------------------------------------------
+      # 11. Patch Image Tags
+      # --------------------------------------------------
+      - name: Patch Image Tags
+        run: |
+          kubectl set image deployment/backend backend=${{ env.BACKEND_IMAGE }} --record
+          kubectl set image deployment/frontend frontend=${{ env.FRONTEND_IMAGE }} --record
+
+      # --------------------------------------------------
+      # 12. Wait for Frontend LB
+      # --------------------------------------------------
+      - name: Get Clean NLB URL
+        run: |
+          for i in {1..30}; do
+            NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [[ -n "$NLB" ]]; then
+              echo "APP_URL=http://$NLB" >> $GITHUB_ENV
+              echo "LIVE: http://$NLB"
+              break
+            fi
+            sleep 10
+          done
+
+      # --------------------------------------------------
+      # 13. Final Summary
+      # --------------------------------------------------
+      - name: Full Summary
+        run: |
+          echo "FULL DEPLOYMENT SUCCESSFUL"
+          echo "EKS: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Backend: ${{ env.BACKEND_IMAGE }}"
+          echo "Frontend: ${{ env.FRONTEND_IMAGE }}"
+          echo "OPEN: ${{ env.APP_URL }}"

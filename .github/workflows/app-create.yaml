@@ -1,0 +1,161 @@
+name: 3. Deploy App to K8s (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: DEPLOY APP'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  deploy-app:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm == 'DEPLOY APP'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS
+      # --------------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 2. Install kubectl + kustomize
+      # --------------------------------------------------
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      # --------------------------------------------------
+      # 3. Update kubeconfig
+      # --------------------------------------------------
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          echo "Connected to EKS"
+
+      # --------------------------------------------------
+      # 4. Login to Docker Hub
+      # --------------------------------------------------
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --------------------------------------------------
+      # 5. Build & Push Backend
+      # --------------------------------------------------
+      - name: Build & Push Backend
+        run: |
+          cd backend
+          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-backend:${{ github.sha }}
+          echo "Building backend: $IMAGE_TAG"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "BACKEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 6. Build & Push Frontend
+      # --------------------------------------------------
+      - name: Build & Push Frontend
+        run: |
+          cd frontend
+          IMAGE_TAG=${{ secrets.DOCKERHUB_USERNAME }}/emp-frontend:${{ github.sha }}
+          echo "Building frontend: $IMAGE_TAG"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "FRONTEND_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 7. Inject Secrets + Apply via Kustomize
+      # --------------------------------------------------
+      - name: Apply K8s via Kustomize (with Secrets)
+        run: |
+          echo "Injecting GitHub Secrets into secrets.env..."
+
+          cat > kustomize/base/secrets.env << EOF
+          POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+          EOF
+
+          echo "Applying all resources via Kustomize..."
+          kustomize build kustomize/base | kubectl apply -f -
+
+          echo "Waiting for Postgres pod to be Ready..."
+          kubectl get po 
+          kubectl logs deploy/postgres
+          kubectl logs deploy/backend
+          kubectl logs deploy/postgres
+          kubectl logs deploy/frontend
+          kubectl get po
+          #kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
+          echo "Postgres is READY"
+
+      # --------------------------------------------------
+      # 8. Patch Image Tags
+      # --------------------------------------------------
+      - name: Patch Image Tags
+        run: |
+          kubectl set image deployment/backend backend=${{ env.BACKEND_IMAGE }} --record
+          kubectl set image deployment/frontend frontend=${{ env.FRONTEND_IMAGE }} --record
+          echo "Images patched"
+
+      # --------------------------------------------------
+      # 9. Wait for Frontend LB
+      # --------------------------------------------------
+      - name: Get Clean NLB URL
+        run: |
+          echo "Waiting for NLB (up to 5 mins)..."
+          NLB=""
+          for i in {1..30}; do
+            NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [[ -n "$NLB" && "$NLB" != "null" ]]; then
+              CLEAN_URL="http://$NLB"
+              echo "APP_URL=$CLEAN_URL" >> $GITHUB_ENV
+              echo "APP IS LIVE: $CLEAN_URL"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 10
+          done
+          
+          if [[ -z "$NLB" || "$NLB" == "null" ]]; then
+            echo "NLB not ready after 5 mins"
+            echo "APP_URL=pending" >> $GITHUB_ENV
+          fi
+
+      # --------------------------------------------------
+      # 10. Final Summary
+      # --------------------------------------------------
+      - name: Deployment Summary
+        run: |
+          echo "APP DEPLOYMENT COMPLETE"
+          echo "Backend: ${{ env.BACKEND_IMAGE }}"
+          echo "Frontend: ${{ env.FRONTEND_IMAGE }}"
+          echo "Access App: ${{ env.APP_URL }}"
+          if [[ "${{ env.APP_URL }}" == *"pending"* ]]; then
+            echo "NLB still provisioning..."
+          else
+            echo "OPEN IN BROWSER: ${{ env.APP_URL }}"
+          fi
