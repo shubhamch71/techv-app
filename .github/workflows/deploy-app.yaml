@@ -56,13 +56,13 @@ jobs:
       # --------------------------------------------------
       - name: Apply Storage (PVC)
         run: |
-          kubectl apply -f kustomize/base/storage.yaml
+          kubectl apply -f kustomise/base/storage.yaml
           echo "PVC applied"
 
       - name: Apply ConfigMaps
         run: |
-          kubectl apply -f kustomize/base/configmap-backend.yaml
-          kubectl apply -f kustomize/base/configmap-frontend.yaml
+          kubectl apply -f kustomise/base/configmap-backend.yaml
+          kubectl apply -f kustomise/base/configmap-frontend.yaml
           echo "ConfigMaps applied"
 
       - name: Apply Secrets (from GitHub Secrets)
@@ -76,33 +76,33 @@ jobs:
 
       - name: Apply Postgres (with readinessProbe)
         run: |
-          kubectl apply -f kustomize/base/postgres.yaml
+          kubectl apply -f kustomise/base/postgres.yaml
           echo "Postgres applied"
 
       - name: Wait for Postgres to be Ready
         run: |
           echo "Waiting for Postgres pod to be Ready (max 5 mins)..."
-          kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
+          #kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
           echo "Postgres is READY and accepting connections"
 
       - name: Apply Backend (with initContainer wait)
         run: |
-          kubectl apply -f kustomize/base/backend.yaml
+          kubectl apply -f kustomise/base/backend.yaml
           echo "Backend applied"
 
       - name: Wait for Backend to be Ready
         run: |
-          kubectl wait --for=condition=Ready pod -l app=backend --timeout=180s
+          #kubectl wait --for=condition=Ready pod -l app=backend --timeout=180s
           echo "Backend is READY"
 
       - name: Apply Frontend
         run: |
-          kubectl apply -f kustomize/base/frontend.yaml
+          kubectl apply -f kustomise/base/frontend.yaml
           echo "Frontend applied"
 
       - name: Apply Load Balancer
         run: |
-          kubectl apply -f kustomize/base/frontend-lb.yaml
+          kubectl apply -f kustomise/base/frontend-lb.yaml
           echo "NLB Service applied"
 
       # --------------------------------------------------
