@@ -50,8 +50,8 @@ jobs:
       # --------------------------------------------------
       # 4. Install Pod Identity Agent (Required for EKS 1.34+)
       # --------------------------------------------------
-      - name: Install Pod Identity Agent
-        run: |
+      # - name: Install Pod Identity Agent
+      #   run: |
           # echo "Installing Pod Identity Agent..."
           # aws eks create-addon \
           #   --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
@@ -59,10 +59,10 @@ jobs:
           #   --resolve-conflicts=OVERWRITE \
           #   || echo "Pod Identity Agent already installed"
 
-          echo "Waiting for Pod Identity Agent..."
-          kubectl wait --for=condition=Available deployment \
-            -n kube-system eks-pod-identity-agent --timeout=120s
-          echo "Pod Identity Agent READY"
+          # echo "Waiting for Pod Identity Agent..."
+          # kubectl wait --for=condition=Available deployment \
+          #   -n kube-system eks-pod-identity-agent --timeout=120s
+          # echo "Pod Identity Agent READY"
 
       # --------------------------------------------------
       # 5. Create IAM Role for EBS CSI (IRSA / Pod Identity)
