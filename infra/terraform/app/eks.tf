@@ -14,9 +14,12 @@ module "eks_cluster" {
 
   cluster_endpoint_public_access = true
 
-  # ✅ This automatically grants your Terraform IAM user full admin rights
+  # Grants Terraform IAM user full admin rights
   enable_cluster_creator_admin_permissions = true
 
+  # --------------------------------------------------
+  # EKS Managed Node Group
+  # --------------------------------------------------
   eks_managed_node_groups = {
     default = {
       instance_types = [var.node_instance_type]
@@ -24,6 +27,21 @@ module "eks_cluster" {
       max_size       = var.node_max_size
       min_size       = var.node_min_size
       additional_security_group_ids = [aws_security_group.eks_app_sg.id]
+    }
+  }
+
+  # --------------------------------------------------
+  # AUTOMATICALLY INSTALL ADDONS
+  # --------------------------------------------------
+  cluster_addons = {
+    aws-ebs-csi-driver = {
+      most_recent = true
+      # Optional: Pin version
+      # resolve_conflicts = "OVERWRITE"
+    }
+
+    eks-pod-identity-agent = {
+      most_recent = true
     }
   }
 
@@ -47,7 +65,91 @@ resource "null_resource" "wait_for_cluster" {
         echo "Cluster not ready yet... sleeping 15s"
         sleep 15
       done
-      echo "✅ EKS cluster is ACTIVE"
+      echo "EKS cluster is ACTIVE"
+    EOT
+    interpreter = ["bash", "-c"]
+  }
+}
+
+# ------------------------------------------------------------
+# Wait for Addons to be Installed
+# ------------------------------------------------------------
+resource "null_resource" "wait_for_addons" {
+  depends_on = [module.eks_cluster, null_resource.wait_for_cluster]
+
+  provisioner "local-exec" {
+    command = <<EOT
+      echo "Waiting for EBS CSI Driver and Pod Identity Agent to be ACTIVE..."
+
+      # Wait for EBS CSI Driver
+      until kubectl get daemonset ebs-csi-controller -n kube-system --kubeconfig <(aws eks update-kubeconfig --name ${module.eks_cluster.cluster_name} --region ${var.region} - <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: ${module.eks_cluster.cluster_endpoint}
+    certificate-authority-data: ${module.eks_cluster.cluster_certificate_authority_data}
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: aws
+  name: aws
+current-context: aws
+users:
+- name: aws
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws
+      args:
+        - "eks"
+        - "get-token"
+        - "--cluster-name"
+        - "${module.eks_cluster.cluster_name}"
+        - "--region"
+        - "${var.region}"
+EOF
+) > /dev/null 2>&1; do
+        echo "ebs-csi-controller not ready... sleeping 10s"
+        sleep 10
+      done
+
+      # Wait for Pod Identity Agent
+      until kubectl get daemonset aws-pod-identity-webhook -n kube-system --kubeconfig <(aws eks update-kubeconfig --name ${module.eks_cluster.cluster_name} --region ${var.region} - <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: ${module.eks_cluster.cluster_endpoint}
+    certificate-authority-data: ${module.eks_cluster.cluster_certificate_authority_data}
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: aws
+  name: aws
+current-context: aws
+users:
+- name: aws
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws
+      args:
+        - "eks"
+        - "get-token"
+        - "--cluster-name"
+        - "${module.eks_cluster.cluster_name}"
+        - "--region"
+        - "${var.region}"
+EOF
+) > /dev/null 2>&1; do
+        echo "aws-pod-identity-webhook not ready... sleeping 10s"
+        sleep 10
+      done
+
+      echo "All addons installed and running!"
     EOT
     interpreter = ["bash", "-c"]
   }
@@ -67,25 +169,28 @@ data "aws_eks_cluster_auth" "this" {
 }
 
 # ------------------------------------------------------------
-# Automatically update kubeconfig so you can access from laptop
+# Automatically update kubeconfig
 # ------------------------------------------------------------
 resource "null_resource" "update_kubeconfig" {
-  depends_on = [data.aws_eks_cluster.this]
+  depends_on = [null_resource.wait_for_addons]  # Wait for addons too
 
   provisioner "local-exec" {
     command = <<EOT
-      echo "🔧 Updating kubeconfig..."
+      echo "Updating kubeconfig..."
       aws eks update-kubeconfig \
         --name ${module.eks_cluster.cluster_name} \
         --region ${var.region}
-      echo "✅ Kubeconfig updated. You can now run 'kubectl get nodes'"
+      echo "Kubeconfig updated. Run: kubectl get nodes"
     EOT
     interpreter = ["bash", "-c"]
   }
 }
 
-#resource "aws_eks_access_entry" "current_user" {
-#  cluster_name  = module.eks_cluster.cluster_name
-#  principal_arn = local.caller_arn
-#  type          = "STANDARD"
-#}
+# Optional: Verify addons
+output "ebs_csi_driver_status" {
+  value = "Installed via cluster_addons"
+}
+
+output "pod_identity_agent_status" {
+  value = "Installed via cluster_addons"
+}
