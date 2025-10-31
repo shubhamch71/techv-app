@@ -72,25 +72,25 @@ jobs:
         run: |
           kubectl apply -f kustomise/base/postgres.yaml
           echo "Waiting for 3 minutes for Postgres to be ready..."
-          sleep 3m  # Wait for Postgres to be ready
+          #sleep 3m  # Wait for Postgres to be ready
 
       - name: Apply Backend
         run: |
           kubectl apply -f kustomise/base/backend.yaml
           echo "Waiting for 3 minutes for Backend to be ready..."
-          sleep 3m  # Wait for Backend to be ready
+          #sleep 3m  # Wait for Backend to be ready
 
       - name: Apply Frontend
         run: |
           kubectl apply -f kustomise/base/frontend.yaml
           echo "Waiting for 3 minutes for Frontend to be ready..."
-          sleep 3m  # Wait for Frontend to be ready
+          #sleep 3m  # Wait for Frontend to be ready
 
       - name: Apply Load Balancer
         run: |
           kubectl apply -f kustomise/base/frontend-lb.yaml
           echo "Waiting for 2 minutes for Load Balancer to be ready..."
-          sleep 2m  # Wait for Load Balancer to be ready
+          #sleep 2m  # Wait for Load Balancer to be ready
 
       # --------------------------------------------------
       # 4. Get NLB URL
@@ -118,18 +118,18 @@ jobs:
         run: |
           echo "=== Checking Pod Status ==="
           kubectl get po
-          sleep 2
+          sleep 4m
 
           echo "=== Postgres Logs ==="
-          kubectl logs deploy/postgres --tail=20
+          kubectl describe deploy/postgres
           sleep 2
 
           echo "=== Backend Logs ==="
-          kubectl logs deploy/backend --tail=20
+          kubectl describe deploy/backend
           sleep 2
 
           echo "=== Frontend Logs ==="
-          kubectl logs deploy/frontend --tail=20
+          kubectl describe deploy/frontend
           sleep 2
 
           echo "=== Final Pods Status ==="
