@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: default
 
 resources:
+  - secrets.yaml
   - storage.yaml
   - configmap-backend.yaml
   - postgres.yaml

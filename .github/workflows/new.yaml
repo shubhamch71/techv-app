@@ -1,0 +1,149 @@
+name: 4. Full Deploy (Backend + Infra + App)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: FDEPLOY'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  full-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm == 'FULL DEPLOY'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS
+      # --------------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+     
+      # --------------------------------------------------
+      # 5. Install kubectl
+      # --------------------------------------------------
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # --------------------------------------------------
+      # 6. Update kubeconfig
+      # --------------------------------------------------
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          echo "Connected to EKS"
+
+      # --------------------------------------------------
+      # 7. Login to Docker Hub
+      # --------------------------------------------------
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --------------------------------------------------
+      # 8. Build & Push Backend
+      # --------------------------------------------------
+
+
+      # --------------------------------------------------
+      # 10. Apply K8s Resources in Order
+      # --------------------------------------------------
+      - name: Apply K8s Resources in Order
+        run: |
+          echo "Applying in order..."
+
+          # 1. Secrets
+          kubectl apply -f kustomise/base/secrets.yaml
+          echo "Secrets applied"
+
+          # 2. Storage
+          kubectl apply -f kustomise/base/storage.yaml
+          echo "Storage applied"
+
+          # 3. ConfigMap
+          kubectl apply -f kustomise/base/configmap-backend.yaml
+          echo "ConfigMap applied"
+
+          # 4. Postgres
+          kubectl apply -f kustomise/base/postgres.yaml
+          echo "Postgres deployment applied"
+
+          # WAIT FOR POSTGRES
+          echo "Waiting for Postgres pod to be Running..."
+          # kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
+          echo "Postgres is READY"
+
+          # 5. Backend
+          kubectl apply -f kustomise/base/backend.yaml
+          echo "Backend applied"
+
+          # 6. Frontend
+          kubectl apply -f kustomise/base/configmap-frontend.yaml
+          kubectl apply -f kustomise/base/frontend.yaml
+          echo "Frontend applied"
+
+          # 7. Load Balancer
+          kubectl apply -f kustomise/base/frontend-lb.yaml
+          echo "Load Balancer applied"
+
+      # --------------------------------------------------
+      # 11. Patch Image Tags
+      # --------------------------------------------------
+
+      # --------------------------------------------------
+      # 12. Wait for Frontend LB
+      # --------------------------------------------------
+      - name: Get Clean NLB URL
+        run: |
+          echo "Waiting for NLB (up to 5 mins)..."
+          NLB=""
+          for i in {1..30}; do
+            NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [[ -n "$NLB" && "$NLB" != "null" ]]; then
+              CLEAN_URL="http://$NLB"
+              echo "APP_URL=$CLEAN_URL" >> $GITHUB_ENV
+              echo "APP IS LIVE: $CLEAN_URL"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 10
+          done
+          
+          if [[ -z "$NLB" || "$NLB" == "null" ]]; then
+            echo "NLB not ready after 5 mins"
+            echo "APP_URL=pending" >> $GITHUB_ENV
+          fi
+
+      # --------------------------------------------------
+      # 13. Final Summary
+      # --------------------------------------------------
+      - name: Full Deployment Summary
+        run: |
+          echo "FULL DEPLOYMENT SUCCESSFUL"
+          echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Backend: ${{ env.BACKEND_IMAGE }}"
+          echo "Frontend: ${{ env.FRONTEND_IMAGE }}"
+          echo "Access App: ${{ env.APP_URL }}"
+          if [[ "${{ env.APP_URL }}" == *"pending"* ]]; then
+            echo "NLB still provisioning..."
+          else
+            echo "OPEN IN BROWSER: ${{ env.APP_URL }}"
+          fi
