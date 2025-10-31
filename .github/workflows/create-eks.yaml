@@ -55,3 +55,100 @@ jobs:
           fi
 
           echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          echo "kubectl installed"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          echo "Connected to EKS: ${{ secrets.EKS_CLUSTER_NAME }}"
+
+      - name: Install Pod Identity Agent
+        run: |
+          echo "Installing Pod Identity Agent..."
+          aws eks create-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name eks-pod-identity-agent \
+            --resolve-conflicts=OVERWRITE \
+            || echo "Pod Identity Agent already installed"
+          sleep 4m
+
+      - name: Create EBS CSI IAM Role (Idempotent)
+        run: |
+          echo "Setting up IAM Role for EBS CSI..."
+
+          # Get OIDC Issuer
+          OIDC_ID=$(aws eks describe-cluster \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --query "cluster.identity.oidc.issuer" \
+            --output text | cut -d '/' -f 5)
+          OIDC_URL="arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:oidc-provider/oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID"
+
+          # Trust Policy JSON
+          cat > ebs-trust-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "$OIDC_URL"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID:aud": "sts.amazonaws.com",
+                    "oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          # Create or reuse role
+          ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+          if [[ -z "$ROLE_ARN" ]]; then
+            echo "Creating IAM role: $ROLE_NAME"
+            ROLE_ARN=$(aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://ebs-trust-policy.json \
+              --query 'Role.Arn' --output text)
+            echo "Role created: $ROLE_ARN"
+          else
+            echo "Using existing role: $ROLE_ARN"
+          fi
+
+          # Attach AWS managed policy
+          aws iam attach-role-policy \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+            --role-name "$ROLE_NAME" \
+            || echo "Policy already attached"
+
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+
+      - name: Install EBS CSI Driver
+        run: |
+          echo "Installing EBS CSI Driver..."
+          aws eks create-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name aws-ebs-csi-driver \
+            --service-account-role-arn ${{ env.ROLE_ARN }} \
+            --resolve-conflicts=OVERWRITE \
+            || echo "EBS CSI already installed"
+          sleep 5m
+          
+
