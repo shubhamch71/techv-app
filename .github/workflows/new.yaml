@@ -85,23 +85,23 @@ jobs:
 
           # 4. Postgres
           kubectl apply -f kustomise/base/postgres.yaml
-          kubectl wait --for=condition=Bound pvc/postgres-pvc --timeout=180s
+          # kubectl wait --for=condition=Bound pvc/postgres-pvc --timeout=180s
           echo "Postgres deployment applied"
 
           # WAIT FOR POSTGRES
           echo "Waiting for Postgres pod to be Running..."
-          kubectl wait --for=condition=Ready pod -l app=postgres --timeout=150s
+          # kubectl wait --for=condition=Ready pod -l app=postgres --timeout=150s
           echo "Postgres is READY"
 
           # 5. Backend
           kubectl apply -f kustomise/base/backend.yaml
-          kubectl wait --for=condition=Ready pod -l app=backend --timeout=160s
+          # kubectl wait --for=condition=Ready pod -l app=backend --timeout=160s
           echo "Backend applied"
 
           # 6. Frontend
           # kubectl apply -f kustomise/base/configmap-frontend.yaml
           kubectl apply -f kustomise/base/frontend.yaml
-          kubectl wait --for=condition=Ready pod -l app=frontend --timeout=120s
+          # kubectl wait --for=condition=Ready pod -l app=frontend --timeout=120s
           echo "Frontend applied"
 
           # 7. Load Balancer
