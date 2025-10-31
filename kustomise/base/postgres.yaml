@@ -14,21 +14,27 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:15
+          image: postgres:15-alpine
           ports:
             - containerPort: 5432
-          env:
-            - name: POSTGRES_USER
-              value: "postgres"
-            - name: POSTGRES_PASSWORD
-              value: "password"
-            - name: POSTGRES_DB
-              value: "employees"
+          envFrom:
+            - secretRef:
+                name: postgres-secret
           volumeMounts:
-            - name: postgres-storage
+            - name: postgres-data
               mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+                - -h
+                - 127.0.0.1
+            initialDelaySeconds: 5
+            periodSeconds: 10
       volumes:
-        - name: postgres-storage
+        - name: postgres-data
           persistentVolumeClaim:
             claimName: postgres-pvc
 ---
@@ -42,4 +48,3 @@ spec:
   ports:
     - port: 5432
       targetPort: 5432
-  type: ClusterIP
