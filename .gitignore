@@ -3,9 +3,35 @@ frontend/node_modules
 #infra/*
 # Ignore Terraform's .terraform directory and its subdirectories
 infra/terraform/.terraform/
-
+infra/terraform/app/.terraform/modules/*
 # Ignore the lock file
 infra/terraform/.terraform.lock.hcl
+
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+*.bak
+*.bkp
+*.pem
+*.key
+*.crt
+*.cert
+*.env
+*.env.*
+.vscode/
+.idea/
+*.swp
+*.swo
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+.DS_Store
+Thumbs.db
+
 
 # Ignore Terraform provider binaries
 infra/terraform/.terraform/providers/
