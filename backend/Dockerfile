@@ -20,8 +20,6 @@ RUN go build -trimpath -ldflags="-s -w" -o server ./main.go
 
 # Stage 2: minimal runtime image
 FROM alpine:3.20
-LABEL org.opencontainers.image.source="(private-repo-or-local)"
-LABEL org.opencontainers.image.description="Go Fiber backend for Employee Management System"
 
 # Install only necessary packages for minimal runtime (and debugging tools if needed)
 RUN apk add --no-cache ca-certificates tzdata curl
