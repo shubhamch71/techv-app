@@ -1,7 +1,6 @@
 # backend/Dockerfile
 # Stage 1: build stage
 FROM golang:1.19-alpine AS builder
-LABEL maintainer="you <you@example.com>"
 
 # Install required packages
 RUN apk add --no-cache build-base git ca-certificates
