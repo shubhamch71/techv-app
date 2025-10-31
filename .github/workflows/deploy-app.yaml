@@ -71,25 +71,48 @@ jobs:
       - name: Apply Postgres
         run: |
           kubectl apply -f kustomise/base/postgres.yaml
-          sleep 2
+          echo "Waiting for 3 minutes for Postgres to be ready..."
+          sleep 3m  # Wait for Postgres to be ready
 
       - name: Apply Backend
         run: |
           kubectl apply -f kustomise/base/backend.yaml
-          sleep 2
+          echo "Waiting for 3 minutes for Backend to be ready..."
+          sleep 3m  # Wait for Backend to be ready
 
       - name: Apply Frontend
         run: |
           kubectl apply -f kustomise/base/frontend.yaml
-          sleep 2
+          echo "Waiting for 3 minutes for Frontend to be ready..."
+          sleep 3m  # Wait for Frontend to be ready
 
       - name: Apply Load Balancer
         run: |
           kubectl apply -f kustomise/base/frontend-lb.yaml
-          sleep 2
+          echo "Waiting for 2 minutes for Load Balancer to be ready..."
+          sleep 2m  # Wait for Load Balancer to be ready
 
       # --------------------------------------------------
-      # 4. Wait for pods and logs
+      # 4. Get NLB URL
+      # --------------------------------------------------
+      - name: Get NLB URL
+        run: |
+          echo "Waiting for Load Balancer (up to 6 min)..."
+          for i in {1..36}; do
+            NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [[ -n "$NLB" && "$NLB" != "null" ]]; then
+              URL="http://$NLB"
+              echo "APP_URL=$URL" >> $GITHUB_ENV
+              echo "APP IS LIVE: $URL"
+              break
+            fi
+            echo "Waiting... ($i/36)"
+            sleep 10
+          done
+          [[ -z "${{ env.APP_URL }}" ]] && echo "APP_URL=pending" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # 5. Wait for pods and logs
       # --------------------------------------------------
       - name: Get Pods Status and Logs
         run: |
@@ -113,7 +136,7 @@ jobs:
           kubectl get po
           
       # --------------------------------------------------
-      # 5. Final Output
+      # 6. Final Output
       # --------------------------------------------------
       - name: Summary
         run: |
