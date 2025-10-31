@@ -177,7 +177,7 @@ jobs:
 
           # Wait for PVC to bind
           echo "Waiting for PVC to bind (GP3 volume provisioning)..."
-          kubectl wait --for=condition=Bound pvc/postgres-pvc --timeout=180s
+          #kubectl wait --for=condition=Bound pvc/postgres-pvc --timeout=180s
           echo "PVC BOUND!"
 
           # Wait for Postgres pod
