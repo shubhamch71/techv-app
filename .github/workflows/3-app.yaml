@@ -52,12 +52,12 @@ jobs:
       # --------------------------------------------------
       - name: Install Pod Identity Agent
         run: |
-          echo "Installing Pod Identity Agent..."
-          aws eks create-addon \
-            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
-            --addon-name eks-pod-identity-agent \
-            --resolve-conflicts=OVERWRITE \
-            || echo "Pod Identity Agent already installed"
+          # echo "Installing Pod Identity Agent..."
+          # aws eks create-addon \
+          #   --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+          #   --addon-name eks-pod-identity-agent \
+          #   --resolve-conflicts=OVERWRITE \
+          #   || echo "Pod Identity Agent already installed"
 
           echo "Waiting for Pod Identity Agent..."
           kubectl wait --for=condition=Available deployment \
