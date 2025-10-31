@@ -1,0 +1,154 @@
+name: 3. Deploy App to K8s (Deploy + Local Access)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: DEPLOY APP'
+        required: true
+
+jobs:
+  deploy-app:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    if: github.event.inputs.confirm == 'DEPLOY APP'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 1. Configure AWS
+      # --------------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # --------------------------------------------------
+      # 2. Install kubectl
+      # --------------------------------------------------
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # --------------------------------------------------
+      # 3. Update kubeconfig
+      # --------------------------------------------------
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          echo "Connected to EKS"
+
+      # --------------------------------------------------
+      # 4. Apply K8s Resources (Simple Order)
+      # --------------------------------------------------
+      - name: Apply K8s Resources
+        run: |
+          echo "Applying K8s resources..."
+
+          kubectl apply -f kustomise/base/storage.yaml
+          echo "Storage applied"
+
+          kubectl apply -f kustomise/base/configmap-backend.yaml
+          echo "ConfigMap applied"
+
+          kubectl apply -f kustomise/base/postgres.yaml
+          echo "Postgres applied"
+
+          echo "Waiting for Postgres pod to be Ready..."
+          # kubectl wait --for=condition=Ready pod -l app=postgres --timeout=300s
+          echo "Postgres is READY"
+
+          kubectl apply -f kustomise/base/backend.yaml
+          echo "Backend applied"
+
+          kubectl apply -f kustomise/base/frontend.yaml
+          echo "Frontend applied"
+
+          kubectl apply -f kustomise/base/frontend-lb.yaml
+          echo "Load Balancer applied"
+
+          echo "=== POD STATUS ==="
+          kubectl get po -o wide
+
+          echo "=== POSTGRES LOGS ==="
+          kubectl logs deploy/postgres --tail=20
+
+          echo "=== BACKEND LOGS ==="
+          kubectl logs deploy/backend --tail=20
+
+          echo "=== FRONTEND LOGS ==="
+          kubectl logs deploy/frontend --tail=20
+
+      # --------------------------------------------------
+      # 5. Wait for NLB URL
+      # --------------------------------------------------
+      - name: Get App URL
+        run: |
+          echo "Waiting for Load Balancer..."
+          for i in {1..30}; do
+            NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [[ -n "$NLB" && "$NLB" != "null" ]]; then
+              URL="http://$NLB"
+              echo "APP_URL=$URL" >> $GITHUB_ENV
+              echo "APP IS LIVE: $URL"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 10
+          done
+
+          if [[ -z "${{ env.APP_URL }}" ]]; then
+            echo "APP_URL=pending" >> $GITHUB_ENV
+          fi
+
+      # --------------------------------------------------
+      # 6. Upload kubeconfig as Artifact (FOR LAPTOP ACCESS)
+      # --------------------------------------------------
+      - name: Upload kubeconfig for Local Access
+        run: |
+          echo "Preparing kubeconfig for download..."
+          mkdir -p ~/.kube
+          cp $HOME/.kube/config ~/.kube/config-backup
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --kubeconfig ./kubeconfig.yaml
+          echo "KUBECONFIG READY: Download from Artifacts below"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeconfig
+          path: ./kubeconfig.yaml
+          retention-days: 1
+
+      # --------------------------------------------------
+      # 7. Final Summary + LOCAL ACCESS INSTRUCTIONS
+      # --------------------------------------------------
+      - name: Deployment Summary + Local Access
+        run: |
+          echo "DEPLOYMENT COMPLETE"
+          echo "Access your app at: ${{ env.APP_URL }}"
+          if [[ "${{ env.APP_URL }}" == "pending" ]]; then
+            echo "NLB still provisioning..."
+          else
+            echo "OPEN IN BROWSER: ${{ env.APP_URL }}"
+          fi
+
+          echo ""
+          echo "LOCAL K8s ACCESS FROM YOUR LAPTOP"
+          echo "1. Go to this workflow run"
+          echo "2. Scroll down to 'Artifacts'"
+          echo "3. Download 'kubeconfig'"
+          echo "4. Run on your laptop:"
+          echo ""
+          echo "   export KUBECONFIG=~/Downloads/kubeconfig"
+          echo "   kubectl get pods"
+          echo "   kubectl port-forward svc/frontend-lb 3000:80"
+          echo ""
+          echo "Now you can access cluster from your laptop!"

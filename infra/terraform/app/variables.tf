@@ -1,7 +1,7 @@
 variable "region" {
   description = "AWS region"
   type        = string
-  default     = "us-west-2"
+  default     = "us-west-1"
 }
 
 variable "cluster_name" {
@@ -25,7 +25,7 @@ variable "vpc_cidr" {
 variable "availability_zones" {
   description = "Availability Zones"
   type        = list(string)
-  default     = ["us-west-2a", "us-west-2b"]
+  default     = ["us-west-1a", "us-west-1c"]
 }
 
 variable "private_subnet_cidrs" {
