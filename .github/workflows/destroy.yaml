@@ -62,7 +62,7 @@ jobs:
         if: env.KUBE_CONNECTED == '0'
         run: |
           echo "Deleting app from EKS..."
-          cd kustomize/overlays/dev
+          cd kustomise/overlays/dev
           kustomize build . | kubectl delete -f - --ignore-not-found=true || true
 
       # --------------------------------------------------
