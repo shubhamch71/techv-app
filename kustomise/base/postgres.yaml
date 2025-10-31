@@ -1,4 +1,4 @@
-# postgres.yaml
+# kustomise/base/postgres.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,15 +29,13 @@ spec:
             - sh
             - -c
             - |
-              echo "Setting up data directory..."
-              mkdir -p /postgres-data/data
-              chown -R 999:999 /postgres-data
-              chmod 700 /postgres-data/data
-              # Remove any lost+found if exists
-              rm -rf /postgres-data/lost+found
+              mkdir -p /var/lib/postgresql/data
+              chown -R 999:999 /var/lib/postgresql/data
+              chmod 700 /var/lib/postgresql/data
+              rm -rf /var/lib/postgresql/data/lost+found || true
           volumeMounts:
             - name: data
-              mountPath: /postgres-data
+              mountPath: /var/lib/postgresql/data
           securityContext:
             runAsUser: 0
       containers:
@@ -50,19 +48,18 @@ spec:
             - containerPort: 5432
           volumeMounts:
             - name: data
-              mountPath: /postgres-data
-              subPath: data
+              mountPath: /var/lib/postgresql/data
           env:
             - name: PGDATA
-              value: /postgres-data/data
+              value: /var/lib/postgresql/data
           livenessProbe:
             exec:
-              command: ["pg_isready", "-U", "postgres"]
+              command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
             initialDelaySeconds: 30
             periodSeconds: 10
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "postgres"]
+              command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
             initialDelaySeconds: 5
             periodSeconds: 5
       volumes:

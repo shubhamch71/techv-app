@@ -1,4 +1,4 @@
-# backend.yaml
+# kustomise/base/backend.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,10 +23,11 @@ spec:
             - sh
             - -c
             - |
-              until nslookup postgres-service.$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace).svc.cluster.local > /dev/null 2>&1; do
-                echo "Waiting for postgres-service..."
-                sleep 2
+              until nc -z postgres-service 5432; do
+                echo "Waiting for postgres-service:5432..."
+                sleep 3
               done
+              echo "Postgres is up!"
       containers:
         - name: backend
           image: shubhamchau/emp-backend:v1.0

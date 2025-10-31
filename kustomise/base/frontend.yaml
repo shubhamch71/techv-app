@@ -1,4 +1,4 @@
-# frontend.yaml
+# kustomise/base/frontend.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,24 +8,17 @@ data:
   nginx.conf: |
     user  nginx;
     worker_processes  auto;
-
-    events {
-        worker_connections  1024;
-    }
-
+    events { worker_connections  1024; }
     http {
         upstream backend {
-            server backend-service:8080;   # ← FIXED: was "backend"
+            server backend-service:8080;
         }
-
         server {
             listen 80;
-
             location / {
                 root /usr/share/nginx/html;
                 try_files $uri $uri/ /index.html;
             }
-
             location /api/ {
                 proxy_pass http://backend/;
                 proxy_set_header Host $host;
@@ -60,11 +53,11 @@ spec:
             - sh
             - -c
             - |
-              until nslookup backend-service.$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace).svc.cluster.local > /dev/null 2>&1; do
-                echo "Waiting for backend-service..."
-                sleep 2
+              until nc -z backend-service 8080; do
+                echo "Waiting for backend-service:8080..."
+                sleep 3
               done
-              echo "backend-service is up!"
+              echo "Backend is up!"
       containers:
         - name: frontend
           image: shubhamchau/emp-frontend:v1.3
@@ -105,12 +98,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: frontend-service
+  name: frontend-lb
   namespace: default
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
 spec:
+  type: LoadBalancer
   selector:
     app: frontend
   ports:
     - port: 80
       targetPort: 80
-  type: ClusterIP
