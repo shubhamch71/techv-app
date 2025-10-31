@@ -103,16 +103,18 @@ jobs:
           # 7. Load Balancer
           kubectl apply -f kustomise/base/frontend-lb.yaml
           echo "Load Balancer applied"
-          sleep 5m
 
           kubectl get po 
           kubectl get po
           sleep 3 
           kubectl get po 
+          kubectl describe deploy/postgres
           kubectl logs deploy/postgres --tail=30
           kubectl get po 
+          kubectl describe deploy/backend
           kubectl logs deploy/backend  --tail=30
           kubectl get po 
+          kubectl  describe deploy/frontend
           kubectl logs deploy/frontend  --tail=30
 
       # --------------------------------------------------
