@@ -42,12 +42,13 @@ jobs:
           echo "Deleting K8s resources..."
           
           # Delete in reverse order
-          kubectl delete -f kustomize/base/frontend-lb.yaml --ignore-not-found=true
-          kubectl delete -f kustomize/base/frontend.yaml --ignore-not-found=true
-          kubectl delete -f kustomize/base/backend.yaml --ignore-not-found=true
-          
+          kubectl delete -f kustomise/base/frontend-lb.yaml --ignore-not-found=true
+          kubectl delete -f kustomise/base/frontend.yaml --ignore-not-found=true
+          kubectl delete -f kustomise/base/backend.yaml --ignore-not-found=true
+          kubectl delete -f kustomise/base/postgres.yaml --ignore-not-found=true
+          kubectl delete -f kustomise/base/configmap-backend.yaml --ignore-not-found=true
           # Delete PVC (data persists)
-          kubectl delete -f kustomize/base/storage.yaml --ignore-not-found=true
+          kubectl delete -f kustomise/base/storage.yaml --ignore-not-found=true
           
           echo "K8s App deleted"
           echo "EKS cluster remains running"
