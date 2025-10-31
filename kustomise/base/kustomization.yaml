@@ -3,7 +3,6 @@ kind: Kustomization
 namespace: default
 
 resources:
-  - secret.yaml
   - storage.yaml
   - configmap-backend.yaml
   - postgres.yaml
@@ -12,7 +11,4 @@ resources:
   - frontend.yaml
   - frontend-lb.yaml
 
-secretGenerator:
-  - name: postgres-secret
-    envs:
-      - secrets.env
+

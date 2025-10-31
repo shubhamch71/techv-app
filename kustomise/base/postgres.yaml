@@ -12,13 +12,6 @@ spec:
       labels:
         app: postgres
     spec:
-      initContainers:
-        - name: wait-for-pvc
-          image: busybox:1.36
-          command: ['sh', '-c', 'until [ -d /var/lib/postgresql/data ]; do echo waiting for PVC; sleep 2; done']
-          volumeMounts:
-            - name: postgres-storage
-              mountPath: /var/lib/postgresql/data
       containers:
         - name: postgres
           image: postgres:15
@@ -26,33 +19,14 @@ spec:
             - containerPort: 5432
           env:
             - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_USER
+              value: "postgres"
             - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_PASSWORD
+              value: "password"
             - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_DB
+              value: "employees"
           volumeMounts:
             - name: postgres-storage
               mountPath: /var/lib/postgresql/data
-          readinessProbe:
-            exec:
-              command:
-                - pg_isready
-                - -U
-                - postgres
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 6
       volumes:
         - name: postgres-storage
           persistentVolumeClaim:
