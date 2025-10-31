@@ -163,16 +163,16 @@ jobs:
           echo "Applying Kubernetes resources in order..."
 
           # 1. StorageClass + PVC
-          kubectl apply -f kustomize/base/storage.yaml
+          kubectl apply -f kustomise/base/storage.yaml
           echo "StorageClass + PVC applied"
 
           # 2. ConfigMaps
-          kubectl apply -f kustomize/base/configmap-backend.yaml
-          kubectl apply -f kustomize/base/configmap-frontend.yaml
+          kubectl apply -f kustomise/base/configmap-backend.yaml
+          kubectl apply -f kustomise/base/configmap-frontend.yaml
           echo "ConfigMaps applied"
 
           # 3. Postgres
-          kubectl apply -f kustomize/base/postgres.yaml
+          kubectl apply -f kustomise/base/postgres.yaml
           echo "Postgres deployment applied"
 
           # Wait for PVC to bind
@@ -182,17 +182,30 @@ jobs:
 
           # Wait for Postgres pod
           echo "Waiting for Postgres pod to be Ready..."
-          kubectl wait --for=condition=Ready pod -l app=postgres --timeout=180s
+          #kubectl wait --for=condition=Ready pod -l app=postgres --timeout=180s
           echo "POSTGRES IS LIVE!"
 
           # 4. Backend
-          kubectl apply -f kustomize/base/backend.yaml
+          kubectl apply -f kustomise/base/backend.yaml
           echo "Backend applied"
 
           # 5. Frontend + LB
-          kubectl apply -f kustomize/base/frontend.yaml
-          kubectl apply -f kustomize/base/frontend-lb.yaml
+          kubectl apply -f kustomise/base/frontend.yaml
+          kubectl apply -f kustomise/base/frontend-lb.yaml
+          kubectl get po 
+          sleep 1m
+          kubectl get po 
+          kubectl logs deploy/postgres
+          kubectl get po 
+          kubectl describe deploy/postgres
+          kubectl logs deploy/backend
+          kubectl describe deploy/backend
+          kubectl get po 
+          kubectl logs deploy/frontend
+          kubectl describe deploy/frontend
           echo "Frontend + NLB applied"
+
+          sleep 2m
 
           # Final status
           echo ""
