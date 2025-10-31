@@ -157,14 +157,14 @@ Each workflow is **idempotent** and **focused**:
 
 
 
-## Roadmap
+<!-- ## Roadmap
 
 - [ ] **ALB + HTTPS** with ACM & custom domain
 - [ ] **ArgoCD** for GitOps CD
 - [ ] **Monitoring**: Prometheus + Grafana
 - [ ] **CI Tests**: Go + React
 - [ ] **JWT Auth**
-- [ ] **Helm Chart** (optional)
+- [ ] **Helm Chart** (optional) -->
 
 ---
 
