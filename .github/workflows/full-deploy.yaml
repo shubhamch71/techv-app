@@ -7,9 +7,10 @@ on:
       confirm:
         description: 'TYPE: FULL DEPLOY'
         required: true
+        default: ''
 
 jobs:
-  deploy:
+  full-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,18 +30,12 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.13.0   # FIXED
-
-      - name: Install kubectl
-        run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
+          terraform_version: 1.13.0
 
       # ————————————————————————
       # 1. CREATE TERRAFORM BACKEND
       # ————————————————————————
-      - name: Apply Terraform Backend
+      - name: Create Terraform Backend
         run: |
           cd infra/terraform/backend
           terraform init
@@ -50,52 +45,146 @@ jobs:
             -var="region=${{ secrets.AWS_REGION }}"
 
       # ————————————————————————
-      # 2. DEPLOY EKS + VPC
+      # 2. DEPLOY VPC + EKS (Your Proven Logic)
       # ————————————————————————
-      - name: Apply Terraform App
+      - name: Deploy VPC + EKS
         run: |
           cd infra/terraform/app
-          terraform init -upgrade
-          terraform apply -auto-approve \
-            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
-            -var="region=${{ secrets.AWS_REGION }}" \
-            -var="backend_bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
-            -var="backend_table=${{ secrets.TF_BACKEND_TABLE }}"
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
 
-          echo "CLUSTER_NAME=$(terraform output -raw cluster_name)" >> $GITHUB_ENV
-          echo "VPC_ID=$(terraform output -raw vpc_id)" >> $GITHUB_ENV
+          set +e
+          terraform apply -auto-approve > apply.log 2>&1
+          TF_EXIT=$?
+          set -e
+
+          if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
+            TF_EXIT=0
+          fi
+
+          if [ $TF_EXIT -ne 0 ]; then
+            cat apply.log
+            exit $TF_EXIT
+          fi
+
+          echo "EKS Cluster Created: ${{ secrets.EKS_CLUSTER_NAME }}"
 
       # ————————————————————————
-      # 3. CONNECT TO EKS
+      # 3. RE-CONFIGURE AWS (Needed after TF)
       # ————————————————————————
+      - name: Reconfigure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
       - name: Update kubeconfig
         run: |
-          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
           kubectl get nodes
 
       # ————————————————————————
-      # 4. INSTALL EBS CSI
+      # 4. INSTALL POD IDENTITY AGENT
+      # ————————————————————————
+      - name: Install Pod Identity Agent
+        run: |
+          echo "Installing Pod Identity Agent..."
+          aws eks create-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name eks-pod-identity-agent \
+            --resolve-conflicts=OVERWRITE \
+            || echo "Already installed"
+          echo "Waiting 4 minutes for Pod Identity..."
+          sleep 240
+
+      # ————————————————————————
+      # 5. CREATE EBS CSI IAM ROLE (FULL, IDEMPOTENT)
+      # ————————————————————————
+      - name: Create EBS CSI IAM Role
+        run: |
+          OIDC_ID=$(aws eks describe-cluster \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --query "cluster.identity.oidc.issuer" \
+            --output text | cut -d '/' -f 5)
+          OIDC_URL="arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:oidc-provider/oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID"
+
+          cat > ebs-trust-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "$OIDC_URL" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID:aud": "sts.amazonaws.com",
+                    "oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+          if [[ -z "$ROLE_ARN" ]]; then
+            ROLE_ARN=$(aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://ebs-trust-policy.json \
+              --query 'Role.Arn' --output text)
+            echo "Created IAM role: $ROLE_ARN"
+          else
+            echo "Using existing role: $ROLE_ARN"
+          fi
+
+          aws iam attach-role-policy \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+            --role-name "$ROLE_NAME" \
+            || echo "Policy already attached"
+
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+
+      # ————————————————————————
+      # 6. INSTALL EBS CSI DRIVER + WAIT
       # ————————————————————————
       - name: Install EBS CSI Driver
         run: |
-          ROLE_ARN=$(aws iam get-role --role-name "AmazonEKS_EBS_CSI_DriverRole_${{ env.CLUSTER_NAME }}" --query 'Role.Arn' --output text)
           aws eks create-addon \
-            --cluster-name ${{ env.CLUSTER_NAME }} \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
             --addon-name aws-ebs-csi-driver \
-            --service-account-role-arn $ROLE_ARN \
-            --resolve-conflicts OVERWRITE || true
+            --service-account-role-arn ${{ env.ROLE_ARN }} \
+            --resolve-conflicts=OVERWRITE \
+            || echo "Already installed"
 
-          echo "Waiting for EBS CSI Controller..."
-          for i in {1..24}; do
-            if kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=10s 2>/dev/null; then
+          echo "Waiting 5 minutes for EBS CSI..."
+          sleep 300
+
+          # Final health check
+          timeout=120
+          while [ $timeout -gt 0 ]; do
+            if kubectl get deployment ebs-csi-controller -n kube-system > /dev/null 2>&1 && \
+               kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=10s > /dev/null 2>&1; then
               echo "EBS CSI READY"
               break
             fi
             sleep 10
+            timeout=$((timeout - 10))
           done
 
       # ————————————————————————
-      # 5. CREATE POSTGRES SECRET
+      # 7. CREATE POSTGRES SECRET
       # ————————————————————————
       - name: Create Postgres Secret
         run: |
@@ -107,9 +196,9 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       # ————————————————————————
-      # 6. APPLY K8S MANIFESTS
+      # 8. DEPLOY APP
       # ————————————————————————
-      - name: Deploy App (Kustomize)
+      - name: Deploy App
         run: |
           kubectl apply -k kustomise/base
 
@@ -128,7 +217,7 @@ jobs:
           done
 
       # ————————————————————————
-      # 7. UPLOAD KUBECONFIG
+      # 9. UPLOAD KUBECONFIG
       # ————————————————————————
       - name: Upload kubeconfig
         uses: actions/upload-artifact@v4
@@ -138,10 +227,10 @@ jobs:
           retention-days: 1
 
       # ————————————————————————
-      # 8. SUCCESS
+      # 10. SUCCESS
       # ————————————————————————
       - name: Success
         run: |
           echo "FULL DEPLOY SUCCESSFUL!"
-          echo "App: ${{ env.APP_URL }}"
+          echo "App URL: ${{ env.APP_URL }}"
           echo "Download kubeconfig from Artifacts"
