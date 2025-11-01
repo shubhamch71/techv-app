@@ -1,4 +1,6 @@
-name: Destroy EKS + VPC Only
+# .github/workflows/eks-destroy.yaml
+
+name: EKS Destroy (Complete Cleanup)
 
 on:
   workflow_dispatch:
@@ -33,17 +35,102 @@ jobs:
         with:
           terraform_version: 1.13.0
 
-      - name: Destroy EKS + VPC
+      - name: Pre-Destroy: Detach Node Group & Drain
+        run: |
+          echo "Pre-cleanup: Scaling down node group to 0..."
+          aws eks update-nodegroup-config --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} --nodegroup-name general --scaling-config "minSize=0,maxSize=0,desiredSize=0" --region ${{ secrets.AWS_REGION }}
+          sleep 120  # Wait for scale-down
+          
+          # Delete Fargate profiles if any
+          aws eks list-fargate-profiles --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} --query 'fargateProfileNames' --output text | xargs -I {} aws eks delete-fargate-profile --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} --fargate-profile-name {} --region ${{ secrets.AWS_REGION }} || true
+          
+          # Delete add-ons
+          aws eks list-addons --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} --query 'addons' --output text | tr ',' '\n' | xargs -I {} aws eks delete-addon --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} --addon-name {} --region ${{ secrets.AWS_REGION }} || true
+          sleep 60
+
+      - name: Destroy EKS + VPC (With State Refresh)
         run: |
           cd infra/terraform/app
+          
+          # Init with backend
           terraform init \
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=eks/app.tfstate" \
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}"
           
-          terraform destroy -auto-approve
-          echo "EKS + VPC destroyed"
+          # Refresh state (critical for detecting changes)
+          terraform refresh -auto-approve
+          
+          # Plan to verify what will be destroyed
+          terraform plan -destroy -out=destroy.tfplan
+          echo "Plan complete - resources to destroy:"
+          terraform show -json destroy.tfplan | jq '.resource_changes | length' || echo "Plan ready"
+          
+          # Destroy with detailed output
+          terraform destroy -auto-approve -detailed-exitcode
+          DESTROY_EXIT=$?
+          
+          if [ $DESTROY_EXIT -eq 0 ]; then
+            echo "✅ EKS + VPC DESTROYED SUCCESSFULLY"
+          elif [ $DESTROY_EXIT -eq 1 ]; then
+            echo "❌ Some resources failed to destroy - check logs"
+            terraform show destroy.tfplan || true
+            exit 1
+          elif [ $DESTROY_EXIT -eq 2 ]; then
+            echo "⚠️ No changes - already clean"
+          fi
+
+      - name: Post-Destroy Verification
+        run: |
+          # Check EKS cluster
+          CLUSTER_STATUS=$(aws eks describe-cluster --name ${{ secrets.EKS_CLUSTER_NAME }} --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
+          if [[ "$CLUSTER_STATUS" == "NOT_FOUND" || "$CLUSTER_STATUS" == "DELETING" ]]; then
+            echo "✅ EKS cluster deleted"
+          else
+            echo "⚠️ EKS still exists ($CLUSTER_STATUS) - manual delete needed"
+          fi
+          
+          # Check VPC
+          VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "")
+          if [[ -n "$VPC_ID" ]]; then
+            aws ec2 describe-vpcs --vpc-ids $VPC_ID --query 'Vpcs[0].State' --output text 2>/dev/null || echo "VPC deleted"
+          fi
+          
+          # Check lingering ENIs/NAT
+          echo "Lingering ENIs:"
+          aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" --query 'NetworkInterfaces[*].NetworkInterfaceId' --output table 2>/dev/null || echo "No ENIs"
+          
+          echo "Lingering NAT Gateways:"
+          aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC_ID" --query 'NatGateways[*].NatGatewayId' --output table 2>/dev/null || echo "No NATs"
+
+      - name: Cleanup IAM Roles & Policies
+        run: |
+          # Delete EBS CSI IAM Role
+          ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
+          aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy || true
+          aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "" || true  # Inline if any
+          aws iam delete-role --role-name "$ROLE_NAME" || true
+          echo "EBS CSI IAM role deleted"
+          
+          # Delete Node Group IAM Role (if exists)
+          NODE_ROLE=$(aws iam list-roles --query "Roles[?contains(RoleName, '${{ secrets.EKS_CLUSTER_NAME }}') && contains(RoleName, 'node')].RoleName" --output text || echo "")
+          if [[ -n "$NODE_ROLE" ]]; then
+            aws iam detach-role-policy --role-name "$NODE_ROLE" --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy || true
+            aws iam detach-role-policy --role-name "$NODE_ROLE" --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy || true
+            aws iam detach-role-policy --role-name "$NODE_ROLE" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+            aws iam delete-role --role-name "$NODE_ROLE" || true
+            echo "Node IAM role deleted: $NODE_ROLE"
+          fi
+          
+          # Delete Cluster IAM Role
+          CLUSTER_ROLE=$(aws iam list-roles --query "Roles[?contains(RoleName, '${{ secrets.EKS_CLUSTER_NAME }}') && contains(RoleName, 'cluster')].RoleName" --output text || echo "")
+          if [[ -n "$CLUSTER_ROLE" ]]; then
+            aws iam delete-role --role-name "$CLUSTER_ROLE" || true
+            echo "Cluster IAM role deleted: $CLUSTER_ROLE"
+          fi
 
       - name: Complete
-        run: echo "EKS DESTROYED - Run Nuclear to delete S3/DynamoDB"
+        run: |
+          echo "✅ EKS DESTROY COMPLETE"
+          echo "Run 'Nuclear Destroy' for full cleanup (S3 + DynamoDB)"

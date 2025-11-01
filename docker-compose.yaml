@@ -1,7 +1,7 @@
 version: "3.9"
 
 services:
-  # 🗄️ PostgreSQL database
+  #  PostgreSQL database
   postgres:
     image: postgres:15-alpine
     container_name: employee-postgres
@@ -20,9 +20,9 @@ services:
       timeout: 5s
       retries: 5
 
-  # ⚙️ Backend (Go Fiber)
+  #  Backend (Go Fiber)
   backend:
-    image: shubhamchau/emp-backend:v1.0   # use your prebuilt image
+    image: shubhamchau/emp-backend:v1.0   
     container_name: employee-backend
     restart: unless-stopped
     depends_on:
@@ -43,9 +43,9 @@ services:
       timeout: 5s
       retries: 5
 
-  # 💻 Frontend (React + Nginx)
+  #  Frontend (React + Nginx)
   frontend:
-    image: shubhamchau/emp-frontend:v1.3   # use your built image
+    image: shubhamchau/emp-frontend:v1.3   
     container_name: employee-frontend
     restart: unless-stopped
     depends_on:

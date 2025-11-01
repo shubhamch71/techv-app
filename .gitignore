@@ -75,3 +75,4 @@ infra/terraform/app/.terraform/providers/registry.terraform.io/hashicorp/time/0.
 infra/terraform/app/.terraform/providers/registry.terraform.io/hashicorp/tls/4.1.0/linux_amd64/terraform-provider-tls_v4.1.0_x5
 .gitignore
 infra/terraform/app/.terraform/providers/registry.terraform.io/hashicorp/tls/4.1.0/linux_amd64/LICENSE.txt
+infra/terraform/app/history.txt

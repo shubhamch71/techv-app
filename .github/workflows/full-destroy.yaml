@@ -1,0 +1,147 @@
+# .github/workflows/full-deploy.yaml
+name: New Full Deploy (Backend + EKS + App)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'TYPE: FULL DEPLOY'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event.inputs.confirm == 'FULL DEPLOY'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # ————————————————————————
+      # 1. CREATE TERRAFORM BACKEND
+      # ————————————————————————
+      - name: Apply Terraform Backend
+        run: |
+          cd infra/terraform/backend
+          terraform init
+          terraform apply -auto-approve \
+            -var="bucket_name=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -var="table_name=${{ secrets.TF_BACKEND_TABLE }}" \
+            -var="region=${{ secrets.AWS_REGION }}"
+
+      # ————————————————————————
+      # 2. DEPLOY EKS + VPC
+      # ————————————————————————
+      - name: Apply Terraform App
+        run: |
+          cd infra/terraform/app
+          terraform init -upgrade
+          terraform apply -auto-approve \
+            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+            -var="region=${{ secrets.AWS_REGION }}" \
+            -var="backend_bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -var="backend_table=${{ secrets.TF_BACKEND_TABLE }}"
+
+          echo "CLUSTER_NAME=$(terraform output -raw cluster_name)" >> $GITHUB_ENV
+          echo "VPC_ID=$(terraform output -raw vpc_id)" >> $GITHUB_ENV
+
+      # ————————————————————————
+      # 3. CONNECT TO EKS
+      # ————————————————————————
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
+          kubectl get nodes
+
+      # ————————————————————————
+      # 4. INSTALL EBS CSI
+      # ————————————————————————
+      - name: Install EBS CSI Driver
+        run: |
+          ROLE_ARN=$(aws iam get-role --role-name "AmazonEKS_EBS_CSI_DriverRole_${{ env.CLUSTER_NAME }}" --query 'Role.Arn' --output text)
+          aws eks create-addon \
+            --cluster-name ${{ env.CLUSTER_NAME }} \
+            --addon-name aws-ebs-csi-driver \
+            --service-account-role-arn $ROLE_ARN \
+            --resolve-conflicts OVERWRITE || true
+
+          echo "Waiting for EBS CSI Controller..."
+          for i in {1..24}; do
+            if kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=10s 2>/dev/null; then
+              echo "EBS CSI READY"
+              break
+            fi
+            sleep 10
+          done
+
+      # ————————————————————————
+      # 5. CREATE POSTGRES SECRET
+      # ————————————————————————
+      - name: Create Postgres Secret
+        run: |
+          kubectl delete secret postgres-secret --ignore-not-found=true
+          kubectl create secret generic postgres-secret \
+            --from-literal=POSTGRES_USER=postgres \
+            --from-literal=POSTGRES_PASSWORD=techv@125 \
+            --from-literal=POSTGRES_DB=employees \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ————————————————————————
+      # 6. APPLY K8S MANIFESTS
+      # ————————————————————————
+      - name: Deploy App (Kustomize)
+        run: |
+          kubectl apply -k kustomise/base
+
+          echo "Waiting for PVC..."
+          kubectl wait --for=condition=Bound pvc/postgres-pvc --timeout=180s
+
+          echo "Waiting for NLB..."
+          for i in {1..30}; do
+            NLB=$(kubectl get svc frontend-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            if [[ -n "$NLB" && "$NLB" != "null" ]]; then
+              echo "APP_URL=http://$NLB" >> $GITHUB_ENV
+              echo "LIVE: http://$NLB"
+              break
+            fi
+            sleep 10
+          done
+
+      # ————————————————————————
+      # 7. UPLOAD KUBECONFIG
+      # ————————————————————————
+      - name: Upload kubeconfig
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeconfig
+          path: ~/.kube/config
+          retention-days: 1
+
+      # ————————————————————————
+      # 8. SUCCESS
+      # ————————————————————————
+      - name: Success
+        run: |
+          echo "FULL DEPLOY SUCCESSFUL!"
+          echo "App: ${{ env.APP_URL }}"
+          echo "Download kubeconfig from Artifacts"

@@ -4,7 +4,7 @@ provider "aws" {
 
 resource "aws_s3_bucket" "tfstate" {
   bucket        = "techv-tfstate-global"
-  force_destroy = false
+  force_destroy = true
 
   tags = {
     Name = "Terraform State Bucket"

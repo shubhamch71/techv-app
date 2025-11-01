@@ -1,0 +1,130 @@
+# .github/workflows/nuclear-destroy.yaml
+name: Nuclear Destroy (Everything)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'TYPE EXACTLY: DESTROY EVERYTHING'
+        required: true
+        type: string
+
+jobs:
+  nuclear-destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event.inputs.confirm == 'DESTROY EVERYTHING'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      # ————————————————————————
+      # 1. DESTROY APP INFRA (EKS + VPC)
+      # ————————————————————————
+      - name: Destroy EKS + VPC
+        run: |
+          cd infra/terraform/app
+          terraform init || true
+          terraform refresh -auto-approve || true
+          terraform destroy -auto-approve \
+            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+            -var="region=${{ secrets.AWS_REGION }}" \
+            -var="backend_bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -var="backend_table=${{ secrets.TF_BACKEND_TABLE }}" || true
+
+      # ————————————————————————
+      # 2. DESTROY TERRAFORM BACKEND
+      # ————————————————————————
+      - name: Destroy Backend (S3 + DynamoDB)
+        run: |
+          cd infra/terraform/backend
+          terraform init || true
+          terraform refresh -auto-approve || true
+          terraform destroy -auto-approve \
+            -var="bucket_name=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -var="table_name=${{ secrets.TF_BACKEND_TABLE }}" \
+            -var="region=${{ secrets.AWS_REGION }}" || true
+
+      # ————————————————————————
+      # 3. FORCE EMPTY & DELETE S3 BUCKET
+      # ————————————————————————
+      - name: Empty S3 Bucket (Versions + Markers)
+        run: |
+          BUCKET="${{ secrets.TF_BACKEND_BUCKET }}"
+          echo "Emptying bucket: $BUCKET"
+
+          # Delete all object versions
+          aws s3api list-object-versions --bucket $BUCKET --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json | \
+            jq -r '.Objects[] | "\(.Key)|\(.VersionId)"' | \
+            while IFS='|' read -r KEY VID; do
+              aws s3api delete-object --bucket $BUCKET --key "$KEY" --version-id "$VID" || true
+            done
+
+          # Delete delete markers
+          aws s3api list-object-versions --bucket $BUCKET --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json | \
+            jq -r '.Objects[] | "\(.Key)|\(.VersionId)"' | \
+            while IFS='|' read -r KEY VID; do
+              aws s3api delete-object --bucket $BUCKET --key "$KEY" --version-id "$VID" || true
+            done
+
+          # Force delete bucket
+          aws s3 rb s3://$BUCKET --force || true
+          echo "S3 bucket deleted"
+
+      # ————————————————————————
+      # 4. CLEANUP IAM, ENIs, NAT, LOGS
+      # ————————————————————————
+      - name: Cleanup IAM Roles
+        run: |
+          ROLE="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
+          aws iam detach-role-policy --role-name "$ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy || true
+          aws iam delete-role --role-name "$ROLE" || true
+
+          # Delete node & cluster roles
+          aws iam list-roles --query "Roles[?contains(RoleName, '${{ secrets.EKS_CLUSTER_NAME }}')].RoleName" --output text | \
+            xargs -I {} aws iam delete-role --role-name {} || true
+
+      - name: Cleanup ENIs & NAT Gateways
+        run: |
+          # ENIs
+          aws ec2 describe-network-interfaces --filters "Name=description,Values=*EKS*" --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text | \
+            xargs -I {} aws ec2 delete-network-interface --network-interface-id {} --region ${{ secrets.AWS_REGION }} || true
+
+          # NAT Gateways
+          aws ec2 describe-nat-gateways --filter "Name=state,Values=available" --query 'NatGateways[*].NatGatewayId' --output text | \
+            xargs -I {} aws ec2 delete-nat-gateway --nat-gateway-id {} --region ${{ secrets.AWS_REGION }} || true
+
+      - name: Cleanup CloudWatch Logs
+        run: |
+          aws logs delete-log-group --log-group-name "/aws/eks/${{ secrets.EKS_CLUSTER_NAME }}/cluster" || true
+          aws logs delete-log-group --log-group-name "/aws/eks/${{ secrets.EKS_CLUSTER_NAME }}/pods" || true
+
+      # ————————————————————————
+      # 5. FINAL VERIFICATION
+      # ————————————————————————
+      - name: Final Check
+        run: |
+          echo "FINAL STATE CHECK"
+          echo "EKS Clusters:"
+          aws eks list-clusters --query 'clusters' --output table || echo "None"
+          echo "VPCs:"
+          aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*techv*" --query 'Vpcs[*].VpcId' --output table || echo "None"
+          echo "S3 Buckets:"
+          aws s3 ls | grep "${{ secrets.TF_BACKEND_BUCKET }}" || echo "Deleted"
+          echo "IAM Roles:"
+          aws iam list-roles --query "Roles[?contains(RoleName, '${{ secrets.EKS_CLUSTER_NAME }}')].RoleName" --output table || echo "None"
+          echo "NUCLEAR DESTROY COMPLETE — AWS ACCOUNT CLEAN"
