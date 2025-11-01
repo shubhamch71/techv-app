@@ -30,12 +30,7 @@ module "eks_cluster" {
     }
   }
 
-  # --------------------------------------------------
-  # NO ADDONS — INSTALLED VIA CLI IN GITHUB ACTIONS
-  # --------------------------------------------------
-  create_aws_ebs_csi_driver_addon = false
-  cluster_addons                  = {}
-}
+
 
 # ------------------------------------------------------------
 # Fetch cluster details AFTER creation
