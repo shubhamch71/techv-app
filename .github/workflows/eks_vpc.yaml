@@ -15,7 +15,6 @@ jobs:
       contents: read
       id-token: write
     if: github.event.inputs.confirm == 'CREATE INFRA'
-
     steps:
       # -------------------------------------------------
       # 0. Checkout & AWS auth
