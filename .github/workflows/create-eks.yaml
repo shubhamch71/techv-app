@@ -17,10 +17,10 @@ jobs:
     if: github.event.inputs.confirm == 'CREATE INFRA'
 
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -31,32 +31,83 @@ jobs:
         with:
           terraform_version: 1.13.0
 
+      # ==================================================
+      # 1. DEPLOY VPC + EKS CLUSTER
+      # ==================================================
       - name: Deploy VPC + EKS
         run: |
           cd infra/terraform/app
+
+          echo "Initializing Terraform with S3 backend..."
           terraform init \
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=eks/app.tfstate" \
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}"
 
+          echo "Applying Terraform (creating VPC + EKS)..."
           set +e
-          terraform apply -auto-approve > apply.log 2>&1
+          terraform apply -auto-approve \
+            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+            > apply.log 2>&1
           TF_EXIT=$?
           set -e
 
+          # Ignore "already exists" errors
           if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
             TF_EXIT=0
           fi
 
           if [ $TF_EXIT -ne 0 ]; then
+            echo "Terraform apply failed:"
             cat apply.log
             exit $TF_EXIT
           fi
 
-          echo "EKS Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
-      
-      - name: Configure AWS Credentials
+          echo "EKS Cluster submitted: ${{ secrets.EKS_CLUSTER_NAME }}"
+
+      # ==================================================
+      # 2. WAIT FOR EKS CLUSTER TO BE ACTIVE
+      # ==================================================
+      - name: Wait for EKS Cluster to be ACTIVE
+        run: |
+          echo "Waiting for EKS cluster '${{ secrets.EKS_CLUSTER_NAME }}' to become ACTIVE..."
+          timeout=1200  # 20 minutes max
+          interval=30
+          elapsed=0
+
+          while [ $elapsed -lt $timeout ]; do
+            STATUS=$(aws eks describe-cluster \
+              --name ${{ secrets.EKS_CLUSTER_NAME }} \
+              --region ${{ secrets.AWS_REGION }} \
+              --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
+
+            echo "Status: $STATUS (elapsed: ${elapsed}s)"
+
+            if [[ "$STATUS" == "ACTIVE" ]]; then
+              echo "EKS CLUSTER IS ACTIVE!"
+              break
+            fi
+
+            if [[ "$STATUS" == "FAILED" ]]; then
+              echo "EKS CLUSTER CREATION FAILED"
+              aws eks describe-cluster --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+              exit 1
+            fi
+
+            sleep $interval
+            elapsed=$((elapsed + interval))
+          done
+
+          if [[ "$STATUS" != "ACTIVE" ]]; then
+            echo "TIMEOUT: Cluster did not become ACTIVE in 20 minutes"
+            exit 1
+          fi
+
+      # ==================================================
+      # 3. RE-AUTHENTICATE & INSTALL KUBECTL
+      # ==================================================
+      - name: Reconfigure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -71,40 +122,47 @@ jobs:
 
       - name: Update kubeconfig
         run: |
-          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} --alias techv
-          echo "Connected to EKS: ${{ secrets.EKS_CLUSTER_NAME }}"
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ secrets.AWS_REGION }} \
+            --alias techv
+          echo "Connected to EKS"
+          kubectl get nodes
 
+      # ==================================================
+      # 4. INSTALL POD IDENTITY AGENT
+      # ==================================================
       - name: Install Pod Identity Agent
         run: |
-          echo "Installing Pod Identity Agent..."
+          echo "Installing eks-pod-identity-agent..."
           aws eks create-addon \
             --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
             --addon-name eks-pod-identity-agent \
             --resolve-conflicts=OVERWRITE \
-            || echo "Pod Identity Agent already installed"
-          sleep 4m
+            || echo "Already installed"
+          echo "Waiting 4 minutes..."
+          sleep 240
 
-      - name: Create EBS CSI IAM Role (Idempotent)
+      # ==================================================
+      # 5. CREATE EBS CSI IAM ROLE (IDEMPOTENT)
+      # ==================================================
+      - name: Create EBS CSI IAM Role
         run: |
-          echo "Setting up IAM Role for EBS CSI..."
-
-          # Get OIDC Issuer
+          echo "Creating EBS CSI IAM role..."
           OIDC_ID=$(aws eks describe-cluster \
             --name ${{ secrets.EKS_CLUSTER_NAME }} \
             --query "cluster.identity.oidc.issuer" \
             --output text | cut -d '/' -f 5)
+
           OIDC_URL="arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:oidc-provider/oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID"
 
-          # Trust Policy JSON
           cat > ebs-trust-policy.json << EOF
           {
             "Version": "2012-10-17",
             "Statement": [
               {
                 "Effect": "Allow",
-                "Principal": {
-                  "Federated": "$OIDC_URL"
-                },
+                "Principal": { "Federated": "$OIDC_URL" },
                 "Action": "sts:AssumeRoleWithWebIdentity",
                 "Condition": {
                   "StringEquals": {
@@ -117,22 +175,19 @@ jobs:
           }
           EOF
 
-          # Create or reuse role
           ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
           ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || echo "")
 
           if [[ -z "$ROLE_ARN" ]]; then
-            echo "Creating IAM role: $ROLE_NAME"
+            echo "Creating new IAM role..."
             ROLE_ARN=$(aws iam create-role \
               --role-name "$ROLE_NAME" \
               --assume-role-policy-document file://ebs-trust-policy.json \
               --query 'Role.Arn' --output text)
-            echo "Role created: $ROLE_ARN"
           else
             echo "Using existing role: $ROLE_ARN"
           fi
 
-          # Attach AWS managed policy
           aws iam attach-role-policy \
             --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
             --role-name "$ROLE_NAME" \
@@ -140,15 +195,37 @@ jobs:
 
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
+      # ==================================================
+      # 6. INSTALL EBS CSI DRIVER + WAIT
+      # ==================================================
       - name: Install EBS CSI Driver
         run: |
-          echo "Installing EBS CSI Driver..."
+          echo "Installing aws-ebs-csi-driver..."
           aws eks create-addon \
             --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
             --addon-name aws-ebs-csi-driver \
             --service-account-role-arn ${{ env.ROLE_ARN }} \
             --resolve-conflicts=OVERWRITE \
-            || echo "EBS CSI already installed"
-          sleep 5m
-          
+            || echo "Already installed"
 
+          echo "Waiting 5 minutes for controller..."
+          sleep 300
+
+          echo "Checking EBS CSI controller..."
+          for i in {1..12}; do
+            if kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=10s >/dev/null 2>&1; then
+              echo "EBS CSI DRIVER READY"
+              break
+            fi
+            sleep 10
+          done
+
+      # ==================================================
+      # 7. SUCCESS
+      # ==================================================
+      - name: Success
+        run: |
+          echo "EKS INFRA CREATION COMPLETE!"
+          echo "Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Region: ${{ secrets.AWS_REGION }}"
+          echo "Run '3. Deploy App' next"
