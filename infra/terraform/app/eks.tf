@@ -30,7 +30,10 @@ module "eks_cluster" {
     }
   }
 
-
+  # --------------------------------------------------
+  # NO ADDONS — INSTALLED VIA CLI IN GITHUB ACTIONS
+  # --------------------------------------------------
+}
 
 # ------------------------------------------------------------
 # Fetch cluster details AFTER creation
