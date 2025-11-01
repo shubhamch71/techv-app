@@ -35,7 +35,7 @@ jobs:
           terraform_version: 1.13.0
 
       # -------------------------------------------------
-      # 1. CLEAN LOCAL STATE (CRITICAL)
+      # 1. CLEAN LOCAL STATE
       # -------------------------------------------------
       - name: Clean Local Terraform State
         run: |
@@ -60,9 +60,10 @@ jobs:
           echo "Backend configured. State will be stored in S3."
 
       # -------------------------------------------------
-      # 3. TERRAFORM APPLY WITH AUTO-IMPORT ON CONFLICT
+      # 3. TERRAFORM APPLY + AUTO-IMPORT + AUTO-UNLOCK
       # -------------------------------------------------
-      - name: Terraform Apply (with Auto-Import)
+      - name: Terraform Apply (with Auto-Import & Auto-Unlock)
+        id: terraform_apply
         run: |
           cd infra/terraform/app
 
@@ -74,18 +75,31 @@ jobs:
           TF_EXIT=$?
           set -e
 
-          # If apply failed due to AlreadyExists → import and retry
+          # === AUTO-UNLOCK ON STATE LOCK ===
+          if grep -q "Error acquiring the state lock\|ConditionalCheckFailedException" apply.log; then
+            echo "State lock detected. Extracting Lock ID..."
+            LOCK_ID=$(grep -o 'ID: [a-f0-9-]\+' apply.log | head -1 | awk '{print $2}')
+            if [[ -n "$LOCK_ID" ]]; then
+              echo "Force unlocking stale lock: $LOCK_ID"
+              terraform force-unlock -force "$LOCK_ID" || echo "Unlock failed (ignore)"
+            fi
+            echo "Retrying apply after unlock..."
+            terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
+            echo "apply_after_unlock=true" >> $GITHUB_OUTPUT
+          fi
+
+          # === AUTO-IMPORT ON AlreadyExists ===
           if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
             echo "Detected existing resources in AWS. Importing into Terraform state..."
 
-            # --- Import IAM User ---
+            # Import IAM User
             if grep -q "aws_iam_user.admin" apply.log; then
               USER_NAME=$(grep -o "User with name [^ ]*" apply.log | awk '{print $4}')
               echo "Importing IAM user: $USER_NAME"
               terraform import aws_iam_user.admin "$USER_NAME" || true
             fi
 
-            # --- Import KMS Key & Alias ---
+            # Import KMS Key & Alias
             if grep -q 'aws_kms_alias.this\["cluster"\]' apply.log; then
               ALIAS_NAME=$(grep -o 'alias/eks/[^ ]*' apply.log | head -1)
               KEY_ID=$(aws kms list-aliases \
@@ -99,7 +113,7 @@ jobs:
               fi
             fi
 
-            # --- Import CloudWatch Log Group ---
+            # Import CloudWatch Log Group
             if grep -q 'aws_cloudwatch_log_group.this\[0\]' apply.log; then
               LOG_GROUP=$(grep -o '/aws/eks/[^ ]*/cluster' apply.log | head -1)
               echo "Importing log group: $LOG_GROUP"
@@ -108,23 +122,38 @@ jobs:
 
             echo "Re-running terraform apply after import..."
             terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
-          else
-            if [ $TF_EXIT -ne 0 ]; then
-              echo "Terraform apply failed:"
-              cat apply.log
-              exit $TF_EXIT
-            fi
+          fi
+
+          # === FINAL EXIT CHECK ===
+          if [ $TF_EXIT -ne 0 ] && [[ ! -f apply.log ]] || ! grep -q "apply_after_unlock=true" $GITHUB_OUTPUT; then
+            echo "Terraform apply failed:"
+            cat apply.log
+            exit $TF_EXIT
           fi
 
           echo "Terraform apply completed successfully."
 
       # -------------------------------------------------
-      # 4. WAIT FOR EKS CLUSTER TO BE ACTIVE
+      # 4. CLEANUP ON FAILURE (FORCE UNLOCK)
+      # -------------------------------------------------
+      - name: Force Unlock on Failure
+        if: failure() && steps.terraform_apply.outcome == 'failure'
+        run: |
+          cd infra/terraform/app
+          echo "Cleaning up stale lock on failure..."
+          LOCK_ID=$(grep -o 'ID: [a-f0-9-]\+' apply.log 2>/dev/null | head -1 | awk '{print $2}' || echo "")
+          if [[ -n "$LOCK_ID" ]]; then
+            echo "Unlocking: $LOCK_ID"
+            terraform force-unlock -force "$LOCK_ID" || true
+          fi
+
+      # -------------------------------------------------
+      # 5. WAIT FOR EKS CLUSTER ACTIVE
       # -------------------------------------------------
       - name: Wait for EKS Cluster to be ACTIVE
         run: |
           echo "Waiting for EKS cluster '${{ secrets.EKS_CLUSTER_NAME }}' to become ACTIVE..."
-          timeout=1200  # 20 minutes
+          timeout=1200
           interval=30
           elapsed=0
 
@@ -157,7 +186,7 @@ jobs:
           fi
 
       # -------------------------------------------------
-      # 5. RE-AUTH & KUBECTL
+      # 6. RE-AUTH & KUBECTL
       # -------------------------------------------------
       - name: Reconfigure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -182,7 +211,7 @@ jobs:
           kubectl get nodes
 
       # -------------------------------------------------
-      # 6. POD IDENTITY AGENT
+      # 7. POD IDENTITY AGENT
       # -------------------------------------------------
       - name: Install Pod Identity Agent
         run: |
@@ -196,7 +225,7 @@ jobs:
           sleep 240
 
       # -------------------------------------------------
-      # 7. EBS CSI IAM ROLE (FULL IDEMPOTENT)
+      # 8. EBS CSI IAM ROLE (FULL IDEMPOTENT + LOGS)
       # -------------------------------------------------
       - name: Create EBS CSI IAM Role
         run: |
@@ -251,9 +280,9 @@ jobs:
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # 8. EBS CSI DRIVER + FULL WAIT LOOP
+      # 9. INSTALL EBS CSI v1.42.0 + FULL WAIT LOOP
       # -------------------------------------------------
-      - name: Install EBS CSI Driver
+      - name: Install EBS CSI Driver v1.42.0
         run: |
           echo "Installing aws-ebs-csi-driver add-on..."
           aws eks create-addon \
@@ -283,7 +312,7 @@ jobs:
           fi
 
       # -------------------------------------------------
-      # 9. SUCCESS
+      # 10. SUCCESS
       # -------------------------------------------------
       - name: Success
         run: |
