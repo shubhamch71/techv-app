@@ -259,6 +259,7 @@ jobs:
           aws eks create-addon \
             --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
             --addon-name aws-ebs-csi-driver \
+            --addon-version v1.42.0 \
             --service-account-role-arn ${{ env.ROLE_ARN }} \
             --resolve-conflicts=OVERWRITE \
             || echo "Already installed"
