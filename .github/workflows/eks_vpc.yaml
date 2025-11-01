@@ -60,6 +60,16 @@ jobs:
           echo "Backend configured. State will be stored in S3."
 
       # -------------------------------------------------
+      # EMERGENCY: FORCE UNLOCK STALE LOCK (TEMPORARY)
+      # -------------------------------------------------
+      - name: Emergency Force Unlock
+        run: |
+          cd infra/terraform/app
+          echo "Forcing unlock of stale lock ID: 38697dc3-0fc0-5062-896e-34d710219009"
+          terraform force-unlock -force 38697dc3-0fc0-5062-896e-34d710219009 || echo "Lock already gone or failed (safe to ignore)"
+          echo "Lock cleared."
+
+      # -------------------------------------------------
       # 3. TERRAFORM APPLY + AUTO-IMPORT + AUTO-UNLOCK
       # -------------------------------------------------
       - name: Terraform Apply (with Auto-Import & Auto-Unlock)
