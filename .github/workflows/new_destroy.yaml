@@ -1,0 +1,124 @@
+# .github/workflows/nuclear-destroy.yaml
+name: Nuclear Destroy (EKS + VPC + IAM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'TYPE: DESTROY ALL'
+        required: true
+        default: ''
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event.inputs.confirm == 'DESTROY ALL'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      # -------------------------------------------------
+      # 1. INIT WITH S3 BACKEND (SAME AS CREATE)
+      # -------------------------------------------------
+      - name: Terraform Init (S3 Backend)
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -reconfigure
+
+      # -------------------------------------------------
+      # 2. DESTROY ALL RESOURCES
+      # -------------------------------------------------
+      - name: Terraform Destroy
+        run: |
+          cd infra/terraform/app
+
+          echo "Starting nuclear destroy..."
+          set +e
+          terraform destroy -auto-approve \
+            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+            > destroy.log 2>&1
+          TF_EXIT=$?
+          set -e
+
+          if [ $TF_EXIT -ne 0 ]; then
+            echo "Destroy failed:"
+            cat destroy.log
+            exit $TF_EXIT
+          fi
+
+          echo "All Terraform-managed resources destroyed."
+
+      # -------------------------------------------------
+      # 3. DELETE EBS CSI ADD-ON (if stuck)
+      # -------------------------------------------------
+      - name: Delete EBS CSI Add-on
+        run: |
+          echo "Deleting EBS CSI add-on..."
+          aws eks delete-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name aws-ebs-csi-driver \
+            --region ${{ secrets.AWS_REGION }} \
+            || echo "EBS CSI add-on not found or already deleted"
+
+      # -------------------------------------------------
+      # 4. DELETE POD IDENTITY ADD-ON
+      # -------------------------------------------------
+      - name: Delete Pod Identity Agent
+        run: |
+          echo "Deleting Pod Identity agent..."
+          aws eks delete-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name eks-pod-identity-agent \
+            --region ${{ secrets.AWS_REGION }} \
+            || echo "Pod Identity agent not found"
+
+      # -------------------------------------------------
+      # 5. DELETE EBS CSI IAM ROLE (if exists)
+      # -------------------------------------------------
+      - name: Delete EBS CSI IAM Role
+        run: |
+          ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Deleting IAM role: $ROLE_NAME"
+          aws iam detach-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+            || true
+
+          aws iam delete-role --role-name "$ROLE_NAME" || echo "Role not found or already deleted"
+
+      # -------------------------------------------------
+      # 6. DELETE TERRAFORM STATE (OPTIONAL)
+      # -------------------------------------------------
+      - name: Delete Terraform State from S3
+        run: |
+          echo "Deleting Terraform state from S3..."
+          aws s3 rm "s3://${{ secrets.TF_BACKEND_BUCKET }}/eks/app.tfstate" || echo "State file not found"
+
+      # -------------------------------------------------
+      # 7. SUCCESS
+      # -------------------------------------------------
+      - name: Nuclear Destroy Complete
+        run: |
+          echo "NUCLEAR DESTROY SUCCESSFUL!"
+          echo "All resources deleted."
+          echo "You can now run '2. Create VPC + EKS' again."
