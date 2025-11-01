@@ -17,6 +17,9 @@ jobs:
     if: github.event.inputs.confirm == 'CREATE INFRA'
 
     steps:
+      # -------------------------------------------------
+      # 0. Checkout & AWS auth
+      # -------------------------------------------------
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -31,9 +34,9 @@ jobs:
         with:
           terraform_version: 1.13.0
 
-      # ==================================================
-      # 1. DEPLOY VPC + EKS CLUSTER
-      # ==================================================
+      # -------------------------------------------------
+      # 1. Terraform – VPC + EKS
+      # -------------------------------------------------
       - name: Deploy VPC + EKS
         run: |
           cd infra/terraform/app
@@ -45,7 +48,7 @@ jobs:
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}"
 
-          echo "Applying Terraform (creating VPC + EKS)..."
+          echo "Applying configuration..."
           set +e
           terraform apply -auto-approve \
             -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
@@ -53,7 +56,7 @@ jobs:
           TF_EXIT=$?
           set -e
 
-          # Ignore "already exists" errors
+          # Ignore "already exists" errors (idempotent)
           if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
             TF_EXIT=0
           fi
@@ -64,15 +67,15 @@ jobs:
             exit $TF_EXIT
           fi
 
-          echo "EKS Cluster submitted: ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Terraform apply complete – resources submitted to AWS."
 
-      # ==================================================
-      # 2. WAIT FOR EKS CLUSTER TO BE ACTIVE
-      # ==================================================
+      # -------------------------------------------------
+      # 2. Wait for EKS cluster to become ACTIVE
+      # -------------------------------------------------
       - name: Wait for EKS Cluster to be ACTIVE
         run: |
-          echo "Waiting for EKS cluster '${{ secrets.EKS_CLUSTER_NAME }}' to become ACTIVE..."
-          timeout=1200  # 20 minutes max
+          echo "Waiting for cluster '${{ secrets.EKS_CLUSTER_NAME }}' to become ACTIVE..."
+          timeout=1200   # 20 minutes max
           interval=30
           elapsed=0
 
@@ -82,7 +85,7 @@ jobs:
               --region ${{ secrets.AWS_REGION }} \
               --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
 
-            echo "Status: $STATUS (elapsed: ${elapsed}s)"
+            echo "Cluster status: $STATUS (elapsed: ${elapsed}s)"
 
             if [[ "$STATUS" == "ACTIVE" ]]; then
               echo "EKS CLUSTER IS ACTIVE!"
@@ -104,9 +107,9 @@ jobs:
             exit 1
           fi
 
-      # ==================================================
-      # 3. RE-AUTHENTICATE & INSTALL KUBECTL
-      # ==================================================
+      # -------------------------------------------------
+      # 3. Re-authenticate (IAM changes after TF)
+      # -------------------------------------------------
       - name: Reconfigure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -129,9 +132,9 @@ jobs:
           echo "Connected to EKS"
           kubectl get nodes
 
-      # ==================================================
-      # 4. INSTALL POD IDENTITY AGENT
-      # ==================================================
+      # -------------------------------------------------
+      # 4. Install Pod-Identity Agent (idempotent)
+      # -------------------------------------------------
       - name: Install Pod Identity Agent
         run: |
           echo "Installing eks-pod-identity-agent..."
@@ -139,16 +142,18 @@ jobs:
             --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
             --addon-name eks-pod-identity-agent \
             --resolve-conflicts=OVERWRITE \
-            || echo "Already installed"
-          echo "Waiting 4 minutes..."
+            || echo "Pod-Identity agent already installed"
+          echo "Waiting 4 minutes for Pod-Identity agent..."
           sleep 240
 
-      # ==================================================
-      # 5. CREATE EBS CSI IAM ROLE (IDEMPOTENT)
-      # ==================================================
+      # -------------------------------------------------
+      # 5. Create EBS-CSI IAM Role – **FULL IDEMPOTENT LOGIC**
+      # -------------------------------------------------
       - name: Create EBS CSI IAM Role
         run: |
-          echo "Creating EBS CSI IAM role..."
+          echo "Setting up IAM role for EBS CSI driver..."
+
+          # Get OIDC issuer ID
           OIDC_ID=$(aws eks describe-cluster \
             --name ${{ secrets.EKS_CLUSTER_NAME }} \
             --query "cluster.identity.oidc.issuer" \
@@ -156,7 +161,7 @@ jobs:
 
           OIDC_URL="arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:oidc-provider/oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID"
 
-          cat > ebs-trust-policy.json << EOF
+          cat > ebs-trust-policy.json <<EOF
           {
             "Version": "2012-10-17",
             "Statement": [
@@ -184,10 +189,12 @@ jobs:
               --role-name "$ROLE_NAME" \
               --assume-role-policy-document file://ebs-trust-policy.json \
               --query 'Role.Arn' --output text)
+            echo "Created role: $ROLE_ARN"
           else
             echo "Using existing role: $ROLE_ARN"
           fi
 
+          echo "Attaching AmazonEBSCSIDriverPolicy..."
           aws iam attach-role-policy \
             --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
             --role-name "$ROLE_NAME" \
@@ -195,37 +202,44 @@ jobs:
 
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
-      # ==================================================
-      # 6. INSTALL EBS CSI DRIVER + WAIT
-      # ==================================================
+      # -------------------------------------------------
+      # 6. Install EBS CSI Driver + **FULL WAIT LOOP**
+      # -------------------------------------------------
       - name: Install EBS CSI Driver
         run: |
-          echo "Installing aws-ebs-csi-driver..."
+          echo "Installing aws-ebs-csi-driver add-on..."
           aws eks create-addon \
             --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
             --addon-name aws-ebs-csi-driver \
             --service-account-role-arn ${{ env.ROLE_ARN }} \
             --resolve-conflicts=OVERWRITE \
-            || echo "Already installed"
+            || echo "EBS CSI driver already installed"
 
-          echo "Waiting 5 minutes for controller..."
+          echo "Waiting 5 minutes for controller to start..."
           sleep 300
 
-          echo "Checking EBS CSI controller..."
+          echo "Checking EBS CSI controller deployment..."
           for i in {1..12}; do
             if kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=10s >/dev/null 2>&1; then
               echo "EBS CSI DRIVER READY"
               break
             fi
+            echo "Controller not ready yet (attempt $i/12)..."
             sleep 10
           done
 
-      # ==================================================
-      # 7. SUCCESS
-      # ==================================================
+          # Final sanity check
+          if ! kubectl get deployment ebs-csi-controller -n kube-system >/dev/null 2>&1; then
+            echo "EBS CSI controller deployment missing!"
+            exit 1
+          fi
+
+      # -------------------------------------------------
+      # 7. Success
+      # -------------------------------------------------
       - name: Success
         run: |
           echo "EKS INFRA CREATION COMPLETE!"
-          echo "Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
-          echo "Region: ${{ secrets.AWS_REGION }}"
-          echo "Run '3. Deploy App' next"
+          echo "Cluster name : ${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Region       : ${{ secrets.AWS_REGION }}"
+          echo "Next step    : Run workflow '3. Deploy App'"
