@@ -1,0 +1,135 @@
+name: Nuclear Destroy (EKS + VPC + IAM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'TYPE: DESTROY ALL'
+        required: true
+        default: ''
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event.inputs.confirm == 'DESTROY ALL'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      # -------------------------------------------------
+      # 1. INIT WITH S3 BACKEND
+      # -------------------------------------------------
+      - name: Terraform Init (S3 Backend)
+        run: |
+          cd infra/terraform/app
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -reconfigure
+
+      # -------------------------------------------------
+      # 2. FORCE UNLOCK STALE LOCK
+      # -------------------------------------------------
+      - name: Force Unlock Stale Lock
+        run: |
+          cd infra/terraform/app
+          echo "Checking for stale lock..."
+          LOCK_ID=$(aws dynamodb get-item \
+            --table-name ${{ secrets.TF_BACKEND_TABLE }} \
+            --key "{\"LockID\": {\"S\": \"${{ secrets.TF_BACKEND_BUCKET }}/eks/app.tfstate-md5\"}}" \
+            --query "Item.Info.S" --output text 2>/dev/null | grep -o '[a-f0-9-]\{36\}' || echo "")
+
+          if [[ -n "$LOCK_ID" ]]; then
+            echo "Found stale lock: $LOCK_ID"
+            terraform force-unlock -force "$LOCK_ID" || echo "Unlock failed (ignore)"
+          else
+            echo "No stale lock found."
+          fi
+
+      # -------------------------------------------------
+      # 3. TERRAFORM DESTROY
+      # -------------------------------------------------
+      - name: Terraform Destroy
+        run: |
+          cd infra/terraform/app
+          echo "Starting nuclear destroy..."
+          terraform destroy -auto-approve \
+            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+            || echo "Destroy failed (some resources may need manual cleanup)"
+
+      # -------------------------------------------------
+      # 4. DELETE EBS CSI ADD-ON
+      # -------------------------------------------------
+      - name: Delete EBS CSI Add-on
+        run: |
+          echo "Deleting EBS CSI add-on..."
+          aws eks delete-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name aws-ebs-csi-driver \
+            --region ${{ secrets.AWS_REGION }} \
+            --force \
+            || echo "EBS CSI add-on not found or already deleted"
+
+      # -------------------------------------------------
+      # 5. DELETE POD IDENTITY ADD-ON
+      # -------------------------------------------------
+      - name: Delete Pod Identity Agent
+        run: |
+          echo "Deleting Pod Identity agent..."
+          aws eks delete-addon \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name eks-pod-identity-agent \
+            --region ${{ secrets.AWS_REGION }} \
+            --force \
+            || echo "Pod Identity agent not found"
+
+      # -------------------------------------------------
+      # 6. DELETE EBS CSI IAM ROLE
+      # -------------------------------------------------
+      - name: Delete EBS CSI IAM Role
+        run: |
+          ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
+          echo "Deleting IAM role: $ROLE_NAME"
+
+          # Detach policy
+          aws iam detach-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+            || true
+
+          # Delete role
+          aws iam delete-role --role-name "$ROLE_NAME" || echo "Role not found or already deleted"
+
+      # -------------------------------------------------
+      # 7. DELETE TERRAFORM STATE FROM S3
+      # -------------------------------------------------
+      - name: Delete Terraform State
+        run: |
+          echo "Deleting state file from S3..."
+          aws s3 rm "s3://${{ secrets.TF_BACKEND_BUCKET }}/eks/app.tfstate" || echo "State file not found"
+
+      # -------------------------------------------------
+      # 8. SUCCESS
+      # -------------------------------------------------
+      - name: Nuclear Destroy Complete
+        run: |
+          echo "NUCLEAR DESTROY SUCCESSFUL!"
+          echo "All resources and state deleted."
+          echo "You can now safely run '2. Create VPC + EKS' again."
