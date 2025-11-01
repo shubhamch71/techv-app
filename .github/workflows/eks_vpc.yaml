@@ -60,7 +60,7 @@ jobs:
           echo "Backend configured. State will be stored in S3."
 
       # -------------------------------------------------
-      # EMERGENCY: FORCE UNLOCK STALE LOCK (TEMPORARY)
+      # EMERGENCY: FORCE UNLOCK STALE LOCK
       # -------------------------------------------------
       - name: Emergency Force Unlock
         run: |
@@ -70,92 +70,136 @@ jobs:
           echo "Lock cleared."
 
       # -------------------------------------------------
-      # 3. TERRAFORM APPLY + AUTO-IMPORT + AUTO-UNLOCK
+      # 3. TERRAFORM PLAN + APPLY (FULLY IDEMPOTENT)
       # -------------------------------------------------
-      - name: Terraform Apply (with Auto-Import & Auto-Unlock)
+      - name: Terraform Plan & Apply (Safe & Idempotent)
         id: terraform_apply
         run: |
           cd infra/terraform/app
+          MAX_RETRIES=3
+          RETRY_COUNT=0
 
-          echo "Running terraform apply..."
-          set +e
-          terraform apply -auto-approve \
-            -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
-            > apply.log 2>&1
-          TF_EXIT=$?
-          set -e
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES..."
 
-          # === AUTO-UNLOCK ON STATE LOCK ===
-          if grep -q "Error acquiring the state lock\|ConditionalCheckFailedException" apply.log; then
-            echo "State lock detected. Extracting Lock ID..."
-            LOCK_ID=$(grep -o 'ID: [a-f0-9-]\+' apply.log | head -1 | awk '{print $2}')
-            if [[ -n "$LOCK_ID" ]]; then
-              echo "Force unlocking stale lock: $LOCK_ID"
-              terraform force-unlock -force "$LOCK_ID" || echo "Unlock failed (ignore)"
-            fi
-            echo "Retrying apply after unlock..."
-            terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
-            echo "apply_after_unlock=true" >> $GITHUB_OUTPUT
-          fi
+            # Refresh state
+            echo "Refreshing Terraform state..."
+            terraform refresh -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" || true
 
-          # === AUTO-IMPORT ON AlreadyExists ===
-          if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
-            echo "Detected existing resources in AWS. Importing into Terraform state..."
+            # Run plan
+            echo "Running terraform plan..."
+            set +e
+            terraform plan \
+              -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+              -detailed-exitcode \
+              > plan.log 2>&1
+            PLAN_EXIT=$?
+            set -e
 
-            # Import IAM User
-            if grep -q "aws_iam_user.admin" apply.log; then
-              USER_NAME=$(grep -o "User with name [^ ]*" apply.log | awk '{print $4}')
-              echo "Importing IAM user: $USER_NAME"
-              terraform import aws_iam_user.admin "$USER_NAME" || true
+            cat plan.log
+
+            # === NO CHANGES ===
+            if [ $PLAN_EXIT -eq 0 ]; then
+              echo "No changes required. Infrastructure is up to date."
+              break
             fi
 
-            # Import KMS Key & Alias
-            if grep -q 'aws_kms_alias.this\["cluster"\]' apply.log; then
-              ALIAS_NAME=$(grep -o 'alias/eks/[^ ]*' apply.log | head -1)
-              KEY_ID=$(aws kms list-aliases \
-                --query "Aliases[?AliasName=='arn:aws:kms:${{ secrets.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:$ALIAS_NAME'].TargetKeyId" \
-                --output text)
-              if [[ -n "$KEY_ID" ]]; then
-                echo "Importing KMS key: $KEY_ID"
-                terraform import "module.eks_cluster.module.kms.aws_kms_key.this[\"cluster\"]" "$KEY_ID" || true
-                echo "Importing KMS alias: $ALIAS_NAME"
-                terraform import "module.eks_cluster.module.kms.aws_kms_alias.this[\"cluster\"]" "$ALIAS_NAME" || true
+            # === CHANGES → APPLY ===
+            if [ $PLAN_EXIT -eq 2 ]; then
+              echo "Changes detected. Running apply..."
+              set +e
+              terraform apply -auto-approve \
+                -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+                > apply.log 2>&1
+              TF_EXIT=$?
+              set -e
+
+              # === LOCK ERROR ===
+              if grep -q "Error acquiring the state lock\|ConditionalCheckFailedException" apply.log; then
+                echo "State lock detected."
+                LOCK_ID=$(grep -o 'ID: [a-f0-9-]\+' apply.log | head -1 | awk '{print $2}')
+                if [[ -n "$LOCK_ID" ]]; then
+                  echo "Force unlocking lock ID: $LOCK_ID"
+                  terraform force-unlock -force "$LOCK_ID" && echo "Unlocked" || echo "Unlock failed, retrying..."
+                fi
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                sleep 10
+                continue
               fi
-            fi
 
-            # Import CloudWatch Log Group
-            if grep -q 'aws_cloudwatch_log_group.this\[0\]' apply.log; then
-              LOG_GROUP=$(grep -o '/aws/eks/[^ ]*/cluster' apply.log | head -1)
-              echo "Importing log group: $LOG_GROUP"
-              terraform import module.eks_cluster.aws_cloudwatch_log_group.this[0] "$LOG_GROUP" || true
-            fi
+              # === AlreadyExists → IMPORT ===
+              if grep -q "EntityAlreadyExists\|AlreadyExistsException" apply.log; then
+                echo "Detected existing resources. Importing..."
 
-            echo "Re-running terraform apply after import..."
-            terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
+                # IAM User
+                if grep -q "aws_iam_user.admin" apply.log; then
+                  USER_NAME=$(grep -o "User with name [^ ]*" apply.log | awk '{print $4}')
+                  echo "Importing IAM user: $USER_NAME"
+                  terraform import aws_iam_user.admin "$USER_NAME" || true
+                fi
+
+                # KMS Key & Alias
+                if grep -q 'aws_kms_alias.this\["cluster"\]' apply.log; then
+                  ALIAS_NAME=$(grep -o 'alias/eks/[^ ]*' apply.log | head -1)
+                  KEY_ID=$(aws kms list-aliases \
+                    --query "Aliases[?AliasName=='arn:aws:kms:${{ secrets.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:$ALIAS_NAME'].TargetKeyId" \
+                    --output text)
+                  [[ -n "$KEY_ID" ]] && terraform import "module.eks_cluster.module.kms.aws_kms_key.this[\"cluster\"]" "$KEY_ID" || true
+                  [[ -n "$ALIAS_NAME" ]] && terraform import "module.eks_cluster.module.kms.aws_kms_alias.this[\"cluster\"]" "$ALIAS_NAME" || true
+                fi
+
+                # CloudWatch Log Group
+                if grep -q 'aws_cloudwatch_log_group.this\[0\]' apply.log; then
+                  LOG_GROUP=$(grep -o '/aws/eks/[^ ]*/cluster' apply.log | head -1)
+                  echo "Importing log group: $LOG_GROUP"
+                  terraform import module.eks_cluster.aws_cloudwatch_log_group.this[0] "$LOG_GROUP" || true
+                fi
+
+                # EKS CLUSTER
+                if ! terraform state list | grep -q "module.eks_cluster.aws_eks_cluster.this"; then
+                  echo "Importing EKS cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
+                  terraform import module.eks_cluster.aws_eks_cluster.this ${{ secrets.EKS_CLUSTER_NAME }} || true
+                fi
+
+                echo "Re-applying after import..."
+                terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
+                break
+              fi
+
+              # === SUCCESS ===
+              if [ $TF_EXIT -eq 0 ]; then
+                echo "Terraform apply completed successfully."
+                break
+              else
+                echo "Apply failed. Retrying..."
+                cat apply.log
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                sleep 10
+              fi
+            else
+              echo "Plan failed. Attempting cluster import..."
+              terraform import module.eks_cluster.aws_eks_cluster.this ${{ secrets.EKS_CLUSTER_NAME }} || true
+              terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
+              break
+            fi
+          done
+
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Max retries reached. Failing."
+            cat plan.log apply.log 2>/dev/null || true
+            exit 1
           fi
 
-          # === FINAL EXIT CHECK ===
-          if [ $TF_EXIT -ne 0 ] && [[ ! -f apply.log ]] || ! grep -q "apply_after_unlock=true" $GITHUB_OUTPUT; then
-            echo "Terraform apply failed:"
-            cat apply.log
-            exit $TF_EXIT
-          fi
-
-          echo "Terraform apply completed successfully."
-
       # -------------------------------------------------
-      # 4. CLEANUP ON FAILURE (FORCE UNLOCK)
+      # 4. CLEANUP ON FAILURE
       # -------------------------------------------------
-      - name: Force Unlock on Failure
-        if: failure() && steps.terraform_apply.outcome == 'failure'
+      - name: Force Unlock on Final Failure
+        if: failure()
         run: |
           cd infra/terraform/app
-          echo "Cleaning up stale lock on failure..."
-          LOCK_ID=$(grep -o 'ID: [a-f0-9-]\+' apply.log 2>/dev/null | head -1 | awk '{print $2}' || echo "")
-          if [[ -n "$LOCK_ID" ]]; then
-            echo "Unlocking: $LOCK_ID"
-            terraform force-unlock -force "$LOCK_ID" || true
-          fi
+          echo "Final cleanup: unlocking any stale lock..."
+          LOCK_ID=$(grep -o 'ID: [a-f0-9-]\+' apply.log plan.log 2>/dev/null | head -1 | awk '{print $2}' || echo "")
+          [[ -n "$LOCK_ID" ]] && terraform force-unlock -force "$LOCK_ID" || true
 
       # -------------------------------------------------
       # 5. WAIT FOR EKS CLUSTER ACTIVE
@@ -235,7 +279,7 @@ jobs:
           sleep 240
 
       # -------------------------------------------------
-      # 8. EBS CSI IAM ROLE (FULL IDEMPOTENT + LOGS)
+      # 8. EBS CSI IAM ROLE (FULL LOGS)
       # -------------------------------------------------
       - name: Create EBS CSI IAM Role
         run: |
@@ -290,7 +334,7 @@ jobs:
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # 9. INSTALL EBS CSI v1.42.0 + FULL WAIT LOOP
+      # 9. INSTALL EBS CSI v1.42.0 + FULL WAIT
       # -------------------------------------------------
       - name: Install EBS CSI Driver v1.42.0
         run: |
