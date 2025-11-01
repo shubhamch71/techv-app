@@ -3,13 +3,13 @@
 ############################################################
 
 #terraform {
-  backend "s3" {
-    bucket         = "techv-tfstate-global"
-    key            = "techv/app.tfstate"
-    region         = "us-west-2"
-    dynamodb_table = "techv-tfstate-lock"
-  }
-}
+#  backend "s3" {
+#    bucket         = "techv-tfstate-global"
+#    key            = "techv/app.tfstate"
+#    region         = "us-west-2"
+#    dynamodb_table = "techv-tfstate-lock"
+#  }
+#}
 
 
 data "aws_caller_identity" "current" {}
