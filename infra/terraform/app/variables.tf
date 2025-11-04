@@ -81,19 +81,3 @@ variable "tags" {
     ManagedBy   = "Terraform"
   }
 }
-
-variable "db_username" {
-  description = "RDS master username"
-  type        = string
-  default     = "postgres"
-}
-
-variable "db_allocated_storage" {
-  type    = number
-  default = 20
-}
-
-variable "db_instance_class" {
-  type    = string
-  default = "db.t3.micro"
-}

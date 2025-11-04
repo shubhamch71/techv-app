@@ -22,10 +22,3 @@ resource "aws_security_group" "eks_node_sg" {
   tags        = merge(var.tags, { Name = "${var.cluster_name}-eks-node-sg" })
 }
 
-# Security group for RDS
-#resource "aws_security_group" "rds_sg" {
-#  name        = "${var.cluster_name}-rds-sg"
-#  description = "Security group for RDS"
-#  vpc_id      = module.vpc.vpc_id
-#  tags        = merge(var.tags, { Name = "${var.cluster_name}-rds-sg" })
-#}

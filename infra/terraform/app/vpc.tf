@@ -14,7 +14,7 @@ module "vpc" {
 
   enable_dns_hostnames = true
   enable_dns_support   = true
-
+  tags = var.tags
   public_subnet_tags = {
     "kubernetes.io/role/elb" = 1
   }
@@ -23,7 +23,6 @@ module "vpc" {
     "kubernetes.io/role/internal-elb" = 1
   }
 
-  tags = merge(var.tags, {
-    "Name" = "${var.cluster_name}-vpc"
-  })
+  create_vpc = true
+  manage_default_security_group = false
 }
