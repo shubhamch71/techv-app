@@ -26,7 +26,7 @@ module "eks_cluster" {
       desired_size   = var.node_desired_size
       max_size       = var.node_max_size
       min_size       = var.node_min_size
-      additional_security_group_ids = [aws_security_group.eks_app_sg.id]
+      #additional_security_group_ids = [aws_security_group.eks_app_sg.id]
     }
   }
 
