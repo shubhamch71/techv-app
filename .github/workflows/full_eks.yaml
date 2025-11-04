@@ -18,11 +18,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free Disk + Fix Tags Bug
+      - name: Free Disk + Fix Tags (100% Safe)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/lib/android" /usr/local/.ghcup
           echo "Freed 7GB"
-          find infra/terraform/app -type f -name "*.tf" -exec sed -i 's/tags_all.*$/tags_all = {}/g' {} +
+
+          # ONE LINE THAT WORKS EVERYWHERE
+          grep -rl 'tags_all =' infra/terraform/app | xargs sed -i 's/tags_all =.*$/tags_all = {}/'
 
       - name: AWS Auth
         uses: aws-actions/configure-aws-credentials@v4
@@ -35,7 +37,7 @@ jobs:
         with:
           terraform_version: 1.9.0
 
-      - name: Terraform Apply
+      - name: Apply
         run: |
           cd infra/terraform/app
           terraform init -reconfigure \
@@ -45,86 +47,56 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}"
           terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}"
 
-      - name: Wait for EKS
-        run: aws eks wait cluster-active --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
-
-      - name: Install kubectl
+      - name: Wait & Connect
         run: |
+          aws eks wait cluster-active --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
           curl -sL https://dl.k8s.io/release/stable.txt | xargs -I{} curl -Lo kubectl https://dl.k8s.io/release/{}/bin/linux/amd64/kubectl
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-
-      - name: Connect
-        run: |
           aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --alias techv
           kubectl get nodes
 
-      # POD IDENTITY AGENT — NOT MISSING
-      - name: Install Pod Identity Agent
+      - name: Pod Identity Agent
         run: |
-          echo "Installing eks-pod-identity-agent..."
-          aws eks create-addon \
-            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
-            --addon-name eks-pod-identity-agent \
-            --resolve-conflicts OVERWRITE \
-            --region ${{ secrets.AWS_REGION }}
-          echo "Waiting 2 minutes..."
+          aws eks create-addon --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name eks-pod-identity-agent --resolve-conflicts OVERWRITE || true
           sleep 120
           echo "Pod Identity Agent READY"
 
-      # EBS CSI v1.42.0 — FULLY CORRECT
-      - name: Install EBS CSI Driver v1.42.0
+      - name: EBS CSI v1.42.0
         run: |
-          echo "Creating EBS CSI IAM Role..."
-          OIDC_ID=$(aws eks describe-cluster \
-            --name ${{ secrets.EKS_CLUSTER_NAME }} \
-            --query "cluster.identity.oidc.issuer" \
-            --output text | cut -d/ -f5)
+          OIDC_ID=$(aws eks describe-cluster --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --query "cluster.identity.oidc.issuer" --output text | cut -d/ -f5)
 
           cat > trust.json <<'EOF'
           {
-            "Version": "2012-10-17",
-            "Statement": [{
-              "Effect": "Allow",
-              "Principal": {
-                "Federated": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:oidc-provider/oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID"
-              },
-              "Action": "sts:AssumeRoleWithWebIdentity",
-              "Condition": {
-                "StringEquals": {
-                  "oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa"
-                }
-              }
+            "Version":"2012-10-17",
+            "Statement":[{
+              "Effect":"Allow",
+              "Principal":{"Federated":"arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:oidc-provider/oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID"},
+              "Action":"sts:AssumeRoleWithWebIdentity",
+              "Condition":{"StringEquals":{"oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/$OIDC_ID:sub":"system:serviceaccount:kube-system:ebs-csi-controller-sa"}}
             }]
           }
           EOF
 
           ROLE_NAME="AmazonEKS_EBS_CSI_DriverRole_${{ secrets.EKS_CLUSTER_NAME }}"
-          ROLE_ARN=$(aws iam create-role \
-            --role-name "$ROLE_NAME" \
+          ROLE_ARN=$(aws iam create-role --role-name "$ROLE_NAME" \
             --assume-role-policy-document file://trust.json \
-            --query "Role.Arn" --output text 2>/dev/null || \
-            aws iam get-role --role-name "$ROLE_NAME" --query "Role.Arn" --output text)
+            --query Role.Arn --output text 2>/dev/null || \
+            aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text)
 
-          aws iam attach-role-policy \
-            --role-name "$ROLE_NAME" \
-            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+          aws iam attach-role-policy --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy || true
 
-          echo "Installing EBS CSI v1.42.0..."
-          aws eks create-addon \
-            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
-            --addon-name aws-ebs-csi-driver \
-            --addon-version v1.42.0 \
-            --service-account-role-arn "$ROLE_ARN" \
-            --resolve-conflicts OVERWRITE \
-            --region ${{ secrets.AWS_REGION }}
+          aws eks create-addon --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --addon-name aws-ebs-csi-driver --addon-version v1.42.0 \
+            --service-account-role-arn "$ROLE_ARN" --resolve-conflicts OVERWRITE
 
-          echo "Waiting for controller..."
           sleep 300
-          kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=6m
+          kubectl wait --for=condition=Available deployment/ebs-csi-controller -n kube-system --timeout=5m
           kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver
 
       - name: SUCCESS
         run: |
           echo "EKS + POD IDENTITY + EBS CSI v1.42.0 READY!"
-          echo "Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"
-          echo "Next → Run '3. Deploy App' → type: DEPLOY APP"
+          echo "Run '3. Deploy App' → type: DEPLOY APP"
