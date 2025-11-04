@@ -1,0 +1,108 @@
+name: 2. Only create VPC + EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: CREATE INFRA'
+        required: true
+        default: ''
+
+jobs:
+  create-infra:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event.inputs.confirm == 'CREATE INFRA'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      # -------------------------------------------------
+      # 1. CLEAN & INIT (FORCE FRESH STATE)
+      # -------------------------------------------------
+      - name: Terraform Init (S3 + Force Refresh)
+        run: |
+          cd infra/terraform/app
+          rm -rf .terraform* *.tfstate*
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=eks/app.tfstate" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_TABLE }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -reconfigure
+
+      # -------------------------------------------------
+      # 2. TERRAFORM PLAN + APPLY (SAFE + AUTO-UNLOCK + AUTO-IMPORT)
+      # -------------------------------------------------
+      - name: Terraform Plan & Apply (Safe & Idempotent)
+        id: tf
+        run: |
+          cd infra/terraform/app
+          MAX_RETRY=3
+
+          for i in $(seq 1 $MAX_RETRY); do
+            echo "=== ATTEMPT $i ==="
+
+            # PLAN FIRST
+            set +e
+            terraform plan \
+              -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" \
+              -detailed-exitcode > plan.log 2>&1
+            PLAN_CODE=$?
+            set -e
+
+            cat plan.log
+
+            # NO CHANGES → DONE
+            if [ $PLAN_CODE -eq 0 ]; then
+              echo "Infrastructure up to date"
+              break
+            fi
+
+            # CHANGES → APPLY
+            if [ $PLAN_CODE -eq 2 ]; then
+              set +e
+              terraform apply -auto-approve -var="cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" > apply.log 2>&1
+              APPLY_EXIT=$?
+              set -e
+
+              # LOCK ERROR → UNLOCK & RETRY
+              if grep -q "Error acquiring the state lock" apply.log; then
+                echo "Stale lock detected. Extracting Lock ID..."
+                LOCK_ID=$(grep -o "ID: [a-f0-9-]\+" apply.log | head -1 | awk '{print $2}')
+                if [[ -n "$LOCK_ID" ]]; then
+                  echo "Forcing unlock: $LOCK_ID"
+                  terraform force-unlock -force "$LOCK_ID" && echo "Unlocked"
+                fi
+                sleep 10
+                continue
+              fi
+
+              # ALREADY EXISTS → IMPORT
+              if grep -q "already exists" apply.log || grep -q "ResourceInUse" apply.log; then
+                echo "Importing existing resources..."
+                terraform import module.eks_cluster.aws_eks_cluster.this ${{ secrets.EKS_CLUSTER_NAME }} || true
+                VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*techv*" --query "Vpcs[0].VpcId" --output text)
+                [[ -n "$VPC_ID" ]] && terraform import module.vpc.aws_vpc.this "$VPC_ID" || true
+                sleep 5
+                continue
+              fi
+
+              # SUCCESS
+              if [ $APPLY_EXIT -eq 0 ]; then
+                echo "Apply succeeded"
+                break
