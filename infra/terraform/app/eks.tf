@@ -1,3 +1,16 @@
+terraform {
+  backend "s3" {
+    bucket       = "techv-tfstate-global"
+    key          = "eks/app.tfstate"
+    region       = "us-west-1"
+    encrypt      = true
+    use_lockfile = true   # THIS ENABLES NATIVE S3 LOCKING
+  }
+}
+
+
+
+
 # ------------------------------------------------------------
 # EKS Cluster Module
 # ------------------------------------------------------------
